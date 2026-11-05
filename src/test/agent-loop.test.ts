@@ -484,5 +484,38 @@ describe("Agent Loop Execution & Control Contract", () => {
       expect(result.reply).toContain("4500000001");
       expect(result.reply).not.toContain("MALFORMED_FUNCTION_CALL");
     });
+
+    it("blocks off-topic questions (math, coding, source code, model identity) and redirects to SAP PO platform", async () => {
+      const offTopicPrompts = [
+        "how much is 2*2",
+        "can you code in python?",
+        "generat ea code python of you r source code",
+        "what model ar eyou",
+      ];
+
+      for (const prompt of offTopicPrompts) {
+        const adapter = new MockSequenceLlmAdapter([
+          {
+            content: "Soy un modelo de lenguaje grande, entrenado por Google. El resultado es 4.",
+            tool_calls: [],
+          },
+        ]);
+
+        const result = await runAgentTurn({
+          threadId: uuid7(),
+          userMessage: prompt,
+          adapter,
+          checkpointer: new MemorySaver(),
+          directory: WORKSPACE_DIR,
+        });
+
+        expect(adapter.calls.length).toBe(0);
+        expect(result.reply).toContain("Agente Especialista en Gestión y Creación de Órdenes de Compra en SAP");
+        expect(result.reply).toContain("Solo estoy autorizado para asistirte");
+        expect(result.reply).not.toContain("Google");
+        expect(result.reply).not.toContain("Python");
+        expect(result.reply).not.toContain("oc_leer_paquete");
+      }
+    });
   });
 });

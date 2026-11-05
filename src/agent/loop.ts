@@ -55,6 +55,32 @@ export interface RunAgentTurnResult {
   error?: string;
 }
 
+export const OFF_TOPIC_GUARDRAIL_REPLY =
+  "Soy el Agente Especialista en Gestión y Creación de Órdenes de Compra en SAP de Periferia IT Group. Solo estoy autorizado para asistirte en la revisión, validación y creación de solicitudes y órdenes de compra dentro de esta plataforma (por ejemplo, `sol-001` a `sol-006`). ¿Qué solicitud de compra deseas procesar?";
+
+const PLATFORM_DOMAIN_KEYWORDS =
+  /\b(sol-\d{3}|sap|orden|órdenes|ordenes|compra|compras|solicitud|solicitudes|proveedor|proveedores|cotizaci|presupuesto|aprobaci|aprobador|factura|iva|impuesto|regla|rc\d+|centro de costo|ceco|confirm|proceder|paquete|evidencia|caso|solicitante|nit|sociedad|periferia|perxia|trazabilidad|idempoten|payload|excel|adjunto)\b/i;
+
+const OFF_TOPIC_OR_PROBING_PATTERNS = [
+  /\b\d+\s*[*+\-/x÷]\s*\d+\b/i,
+  /\b(how much is|cu[aá]nto es|calcula|resuelve)\b/i,
+  /\b(python|javascript|typescript|java|c\+\+|c#|golang|rust|ruby|php|html|css|bash|shell|code|coding|programar|programaci[oó]n|source\s*code|c[oó]digo\s*fuente|script)\b/i,
+  /\b(what\s+model|which\s+model|qu[eé]\s+modelo|model\s+ar\s*e\s*you|who\s+trained|qui[eé]n\s+te\s+entren[oó]|system\s*prompt|prompt\s+del\s+sistema|openai|chatgpt|gpt-\d|gemini|anthropic|claude|large\s+language\s+model|modelo\s+de\s+lenguaje)\b/i,
+  /\b(tell\s+me\s+a\s+joke|cu[eé]ntame\s+un\s+chiste|write\s+a\s+poem|escribe\s+un\s+poema|receta\s+de|weather\s+in|clima\s+en)\b/i,
+];
+
+const OUTPUT_LEAKAGE_PATTERNS =
+  /modelo de lenguaje grande|large language model|entrenado por google|trained by google|puedo generar c[oó]digo python|```python|oc_leer_paquete|oc_validar|oc_construir_payload|oc_generar_evidencia|oc_crear/i;
+
+export function isOffTopicQuery(userMessage: string): boolean {
+  const trimmed = userMessage.trim();
+  if (!trimmed) return false;
+  if (PLATFORM_DOMAIN_KEYWORDS.test(trimmed)) {
+    return false;
+  }
+  return OFF_TOPIC_OR_PROBING_PATTERNS.some((pattern) => pattern.test(trimmed));
+}
+
 function appendLog(
   directory: string,
   entry: {
@@ -120,11 +146,44 @@ export function buildSapPurchaseOrderAgent(params: {
         });
       }
 
+      if (params.getExecutedCount() === 0) {
+        const agentMsgs = baseMessagesToAgentMessages(request.messages);
+        const lastUserMsg = [...agentMsgs].reverse().find((m) => m.role === "user");
+        if (lastUserMsg?.content && isOffTopicQuery(lastUserMsg.content)) {
+          return new AIMessage({
+            content: OFF_TOPIC_GUARDRAIL_REPLY,
+          });
+        }
+      }
+
       try {
         const aiMsg = await handler(request);
         const totalTokens = aiMsg.usage_metadata?.total_tokens;
         if (typeof totalTokens === "number" && totalTokens > 0) {
           params.onTokensUsed(totalTokens);
+        }
+        const rawText =
+          typeof aiMsg.content === "string"
+            ? aiMsg.content
+            : Array.isArray(aiMsg.content)
+              ? aiMsg.content
+                  .map((b) =>
+                    typeof b === "string"
+                      ? b
+                      : typeof b === "object" && b !== null && "text" in b
+                        ? String((b as { text?: unknown }).text ?? "")
+                        : "",
+                  )
+                  .join("")
+              : "";
+        if (
+          params.getExecutedCount() === 0 &&
+          (!aiMsg.tool_calls || aiMsg.tool_calls.length === 0) &&
+          OUTPUT_LEAKAGE_PATTERNS.test(rawText)
+        ) {
+          return new AIMessage({
+            content: OFF_TOPIC_GUARDRAIL_REPLY,
+          });
         }
         return aiMsg;
       } catch (err: unknown) {
