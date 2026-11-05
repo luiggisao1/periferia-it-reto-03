@@ -1,22 +1,7 @@
-import {
-  AIMessage,
-  HumanMessage,
-  SystemMessage,
-  ToolMessage,
-  type BaseMessage,
-} from "@langchain/core/messages";
-import {
-  BaseChatModel,
-  type BaseChatModelParams,
-} from "@langchain/core/language_models/chat_models";
+import { AIMessage, HumanMessage, SystemMessage, ToolMessage, type BaseMessage } from "@langchain/core/messages";
+import { BaseChatModel, type BaseChatModelParams } from "@langchain/core/language_models/chat_models";
 import type { ChatResult } from "@langchain/core/outputs";
-import type {
-  LlmAdapter,
-  AgentMessage,
-  ToolDefinition,
-  LlmResponse,
-  ToolCallRequest,
-} from "./adapter";
+import type { LlmAdapter, AgentMessage, ToolDefinition, LlmResponse, ToolCallRequest } from "./adapter";
 
 /**
  * Convierte BaseMessage[] de LangChain a AgentMessage[] del contrato LlmAdapter.
@@ -34,7 +19,7 @@ export function baseMessagesToAgentMessages(messages: BaseMessage[]): AgentMessa
                   ? block
                   : typeof block === "object" && block !== null && "text" in block
                     ? String((block as { text?: unknown }).text ?? "")
-                    : ""
+                    : "",
               )
               .join("")
           : String(m.content ?? "");
@@ -217,9 +202,6 @@ export class AdapterChatModel extends BaseChatModel {
   }
 }
 
-/**
- * Clase base abstracta del patrón Strategy para proveedores de IA (inspirado en interviewer-ai `AIProvider` / `BaseLLMProvider`).
- */
 export abstract class AIProvider implements LlmAdapter {
   abstract readonly name: string;
   abstract readonly model: string;
@@ -262,7 +244,7 @@ export abstract class AIProvider implements LlmAdapter {
                   ? block
                   : typeof block === "object" && block !== null && "text" in block
                     ? String((block as { text?: unknown }).text ?? "")
-                    : ""
+                    : "",
               )
               .join("")
           : null;

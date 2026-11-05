@@ -14,15 +14,11 @@ export interface ProviderFactoryOptions {
   temperature?: number;
 }
 
-/**
- * Factory del patrón Strategy (inspirado en `interviewer-ai/backend/app/services/factory.py`).
- * Resuelve e instancia el proveedor adecuado (`GeminiProvider`, `OpenAIProvider`,
- * `AnthropicProvider` o `DeterministicProvider`) compartiendo la clase base `AIProvider`.
- */
 export function createProvider(options?: ProviderFactoryOptions): AIProvider {
   const rawProvider = (options?.provider || process.env.LLM_PROVIDER || "auto").trim().toLowerCase();
 
-  const googleKey = options?.apiKey || (process.env.GOOGLE_API_KEY || "").trim() || (process.env.GEMINI_API_KEY || "").trim();
+  const googleKey =
+    options?.apiKey || (process.env.GOOGLE_API_KEY || "").trim() || (process.env.GEMINI_API_KEY || "").trim();
   const openaiKey = options?.apiKey || (process.env.OPENAI_API_KEY || "").trim();
   const anthropicKey = options?.apiKey || (process.env.ANTHROPIC_API_KEY || "").trim();
 
