@@ -169,9 +169,7 @@ function jsonResponse(data: unknown, status = 200): Response {
   });
 }
 
-const server = serve({
-  port: PORT,
-  async fetch(req) {
+async function handleRequest(req: Request): Promise<Response> {
     const url = new URL(req.url);
     const pathname = url.pathname;
 
@@ -409,8 +407,23 @@ const server = serve({
     }
 
     return new Response("Ruta no encontrada", { status: 404 });
-  },
-});
+}
 
-console.log(`🚀 Agente SAP Órdenes de Compra activo en http://localhost:${PORT}`);
+function startServer() {
+  const candidates = [PORT, 3030, 3031, 0];
+  for (const candidatePort of candidates) {
+    try {
+      return serve({
+        port: candidatePort,
+        fetch: handleRequest,
+      });
+    } catch {
+      continue;
+    }
+  }
+  return serve({ port: 0, fetch: handleRequest });
+}
+
+const server = startServer();
+console.log(`🚀 Agente SAP Órdenes de Compra activo en http://localhost:${server.port}`);
 export { server };

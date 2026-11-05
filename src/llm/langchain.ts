@@ -22,9 +22,24 @@ export interface LangChainModelConfig {
 
 export class LangChainLlmAdapter implements LlmAdapter {
   private config: LangChainModelConfig;
+  public readonly provider: string;
+  public readonly model: string;
 
   constructor(config?: LangChainModelConfig) {
     this.config = config ?? {};
+    const prov =
+      this.config.provider ??
+      (process.env.LLM_PROVIDER as "openai" | "google" | "anthropic" | undefined) ??
+      "openai";
+    this.provider = prov;
+    if (prov === "google") {
+      this.model = this.config.modelName ?? process.env.LLM_MODEL ?? process.env.GOOGLE_MODEL ?? "gemini-2.0-flash";
+    } else if (prov === "anthropic") {
+      this.model =
+        this.config.modelName ?? process.env.LLM_MODEL ?? process.env.ANTHROPIC_MODEL ?? "claude-3-5-haiku-latest";
+    } else {
+      this.model = this.config.modelName ?? process.env.LLM_MODEL ?? process.env.OPENAI_MODEL ?? "gpt-4o-mini";
+    }
   }
 
   async enviar(mensajes: AgentMessage[], herramientas?: ToolDefinition[]): Promise<LlmResponse> {
@@ -143,20 +158,69 @@ export class LangChainLlmAdapter implements LlmAdapter {
  * Adaptador heurístico determinista para pruebas locales o demostraciones sin API key externa
  */
 export class HeuristicFallbackLlmAdapter implements LlmAdapter {
+  public readonly provider = "langchain-local-fallback";
+  public readonly model = "deterministic-sap-agent-v1";
+
   async enviar(mensajes: AgentMessage[], _herramientas?: ToolDefinition[]): Promise<LlmResponse> {
-    const lastUser = [...mensajes].reverse().find((m) => m.role === "user");
-    const lastTool = [...mensajes].reverse().find((m) => m.role === "tool");
+    const lastUserIndex = mensajes.map((m) => m.role).lastIndexOf("user");
+    const lastUser = lastUserIndex >= 0 ? mensajes[lastUserIndex] : undefined;
     const userText = lastUser?.content?.toLowerCase() ?? "";
 
-    // Detectar caso mencionado (sol-001 a sol-006)
-    const casoMatch = userText.match(/\b(sol-\d{3})\b/i);
-    const caso = casoMatch ? casoMatch[1]?.toLowerCase() : "sol-001";
+    // Detectar si el usuario está rechazando
+    if (userText.includes("no confirmo") || userText.includes("rechazar") || userText.includes("devuelve el caso")) {
+      return {
+        content:
+          "Entendido. Se ha cancelado la creación de la Orden de Compra en SAP y se recomienda devolver el paquete al solicitante para ajustar las inconsistencias detectadas.",
+        tool_calls: [],
+      };
+    }
 
-    // Si aún no hemos llamado a oc_leer_paquete para este caso
-    const hasRead = mensajes.some(
-      (m) => m.role === "tool" && m.name === "oc_leer_paquete"
-    );
-    if (!hasRead) {
+    // Detectar caso mencionado en el último mensaje o recuperar el último caso leído en la sesión
+    const casoMatch = userText.match(/\b(sol-\d{3})\b/i);
+    let caso = casoMatch ? casoMatch[1]?.toLowerCase() : undefined;
+
+    if (!caso) {
+      for (let i = mensajes.length - 1; i >= 0; i--) {
+        const m = mensajes[i];
+        if (m?.role === "assistant" && m.tool_calls) {
+          for (const tc of m.tool_calls) {
+            try {
+              const parsed = JSON.parse(tc.function.arguments);
+              if (typeof parsed.caso === "string") {
+                caso = parsed.caso;
+                break;
+              }
+            } catch {}
+          }
+        }
+        if (caso) break;
+      }
+    }
+    caso = caso ?? "sol-001";
+
+    // Buscar herramientas ya ejecutadas para este caso específico
+    const toolMessagesForCase = mensajes.filter((m, idx) => {
+      if (m.role !== "tool") return false;
+      // Verificar si la llamada previa corresponde al caso activo
+      for (let j = idx - 1; j >= 0; j--) {
+        const prev = mensajes[j];
+        if (prev?.role === "assistant" && prev.tool_calls) {
+          const matchingCall = prev.tool_calls.find((tc) => tc.id === m.tool_call_id);
+          if (matchingCall) {
+            try {
+              const args = JSON.parse(matchingCall.function.arguments);
+              return args.caso === caso;
+            } catch {
+              return true;
+            }
+          }
+        }
+      }
+      return true;
+    });
+
+    const readMsg = [...toolMessagesForCase].reverse().find((m) => m.name === "oc_leer_paquete");
+    if (!readMsg) {
       return {
         content: null,
         tool_calls: [
@@ -172,19 +236,13 @@ export class HeuristicFallbackLlmAdapter implements LlmAdapter {
       };
     }
 
-    // Si leímos paquete pero no hemos validado
-    const hasValidated = mensajes.some(
-      (m) => m.role === "tool" && m.name === "oc_validar"
-    );
-    if (!hasValidated) {
-      const readMsg = mensajes.find(
-        (m) => m.role === "tool" && m.name === "oc_leer_paquete"
-      );
-      let pkg: unknown = {};
-      try {
-        pkg = JSON.parse(readMsg?.content || "{}").data;
-      } catch {}
+    let pkg: Record<string, unknown> = {};
+    try {
+      pkg = JSON.parse(readMsg.content || "{}").data ?? {};
+    } catch {}
 
+    const valMsg = [...toolMessagesForCase].reverse().find((m) => m.name === "oc_validar");
+    if (!valMsg) {
       return {
         content: null,
         tool_calls: [
@@ -200,50 +258,110 @@ export class HeuristicFallbackLlmAdapter implements LlmAdapter {
       };
     }
 
-    // Revisar resultado de validación
-    const valMsg = mensajes.find(
-      (m) => m.role === "tool" && m.name === "oc_validar"
-    );
-    let valResult: any = null;
+    let valResult: Record<string, unknown> | null = null;
     try {
-      valResult = JSON.parse(valMsg?.content || "{}").data;
+      valResult = JSON.parse(valMsg.content || "{}").data ?? null;
     } catch {}
 
-    if (valResult && !valResult.apta) {
-      const bloqueosDesc = valResult.bloqueos
-        ?.map((b: any) => `• [${b.codigo}] ${b.detalle} (Acción: ${b.accion_sugerida})`)
+    if (valResult && valResult.apta === false) {
+      const bloqueos = (valResult.bloqueos as Array<Record<string, string>> | undefined) ?? [];
+      const bloqueosDesc = bloqueos
+        .map((b) => `• **[${b.codigo}]** ${b.detalle}\n  ↳ *Acción sugerida:* ${b.accion_sugerida}`)
         .join("\n");
       return {
-        content: `La solicitud ${caso.toUpperCase()} fue **BLOQUEADA** por control interno de compras:\n\n${bloqueosDesc}\n\nNo es posible generar la orden de compra en SAP hasta que se subsanen estos requisitos.`,
+        content: `La solicitud **${caso.toUpperCase()}** fue **BLOQUEADA** por control interno de compras:\n\n${bloqueosDesc}\n\nNo es posible generar la orden de compra en SAP hasta que se subsanen estos requisitos.`,
         tool_calls: [],
       };
     }
 
-    // Si requiere confirmación y el usuario no ha dicho confirmar
-    const hasConfirmationRules =
-      valResult?.confirmaciones && valResult.confirmaciones.length > 0;
+    // Generar evidencia de aprobación antes de construir el payload
+    const evidMsg = [...toolMessagesForCase].reverse().find((m) => m.name === "oc_generar_evidencia");
+    if (!evidMsg) {
+      return {
+        content: null,
+        tool_calls: [
+          {
+            id: `call_evid_${Date.now()}`,
+            type: "function",
+            function: {
+              name: "oc_generar_evidencia",
+              arguments: JSON.stringify({ caso }),
+            },
+          },
+        ],
+      };
+    }
+
+    // Construir el payload SAP con trazabilidad
+    const payloadMsg = [...toolMessagesForCase].reverse().find((m) => m.name === "oc_construir_payload");
+    if (!payloadMsg) {
+      return {
+        content: null,
+        tool_calls: [
+          {
+            id: `call_payload_${Date.now()}`,
+            type: "function",
+            function: {
+              name: "oc_construir_payload",
+              arguments: JSON.stringify({
+                caso,
+                paquete: pkg,
+                derivados: (valResult?.derivados as Record<string, unknown>) ?? {},
+              }),
+            },
+          },
+        ],
+      };
+    }
+
+    let payloadData: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(payloadMsg.content || "{}");
+      payloadData = (parsed.data?.orden ?? parsed.data ?? {}) as Record<string, unknown>;
+    } catch {}
+
+    const confirmaciones = (valResult?.confirmaciones as Array<Record<string, string>> | undefined) ?? [];
+    const hasConfirmationRules = confirmaciones.length > 0;
+    const isExplicitlyAskingNotToCreateYet = userText.includes("no la crees");
     const isUserConfirming =
-      userText.includes("confirmo") ||
-      userText.includes("confirmar") ||
-      userText.includes("proceder") ||
-      userText.includes("sí") ||
-      userText.includes("si");
+      !isExplicitlyAskingNotToCreateYet &&
+      (userText.includes("confirmo") ||
+        userText.includes("confirmar y crear") ||
+        userText.includes("proceder") ||
+        userText === "sí" ||
+        userText === "si");
+
+    const proveedorObj = (payloadData.proveedor as Record<string, string> | undefined) ?? {};
+    const posicionesArr = (payloadData.posiciones as Array<Record<string, unknown>> | undefined) ?? [];
+    const pos0 = posicionesArr[0] ?? {};
+    const aprobadorObj = (payloadData.aprobador as Record<string, string> | undefined) ?? {};
+
+    const resumenTabla = [
+      `### Vista Previa del Payload SAP (${caso.toUpperCase()})`,
+      `• **Sociedad / Org. Compras:** ${String(payloadData.sociedad ?? "1000")} / ${String(payloadData.organizacion_compras ?? "1000")}`,
+      `• **Proveedor SAP:** ${proveedorObj.codigo_sap ?? "N/A"} — ${proveedorObj.nombre ?? ""} (NIT: ${proveedorObj.nit ?? ""})`,
+      `• **Posición 10:** ${String(pos0.descripcion ?? "")} | Cant: ${String(pos0.cantidad ?? "")} ${String(pos0.unidad ?? "UN")} | Unitario: $${Number(pos0.precio_unitario ?? 0).toLocaleString("es-CO")} ${String(payloadData.moneda ?? "COP")}`,
+      `• **Imputación:** Centro ${String(pos0.centro_costo ?? "")} (${String(pos0.subarea ?? "")}) | IVA: ${String(pos0.indicador_iva ?? "C1")} | Pago: ${String(payloadData.condiciones_pago ?? "Z030")}`,
+      `• **Evidencia Aprobación (${aprobadorObj.email ?? ""}):** SHA-256 \`${String(aprobadorObj.evidencia_sha256 ?? "").slice(0, 16)}...\` (\`out/${caso}/aprobacion.pdf\`)`,
+    ].join("\n");
 
     if (hasConfirmationRules && !isUserConfirming) {
-      const confDesc = valResult.confirmaciones
-        ?.map((c: any) => `• [${c.codigo}] ${c.detalle} (Acción: ${c.accion_sugerida})`)
+      const confDesc = confirmaciones
+        .map((c) => `• **[${c.codigo}]** ${c.detalle}\n  ↳ *Recomendación:* ${c.accion_sugerida}`)
         .join("\n");
       return {
-        content: `La solicitud ${caso.toUpperCase()} es apta pero presenta observaciones que requieren **confirmación explícita**:\n\n${confDesc}\n\n¿Deseas confirmar la creación de la orden de compra con estas condiciones?`,
+        content: `${resumenTabla}\n\n### Validaciones y Confirmaciones Pendientes\nLa solicitud **${caso.toUpperCase()}** pasó los controles bloqueantes (RC1–RC4, RC10), pero requiere tu **confirmación explícita** antes de crear la OC en SAP:\n\n${confDesc}\n\n¿Confirmas la creación de la orden de compra bajo estas condiciones?`,
         tool_calls: [],
       };
     }
 
-    // Si ya confirmó o no requería confirmación, y no hemos creado
-    const hasCreated = mensajes.some(
+    // Verificar si ya ejecutamos oc_crear en este turno (después del último mensaje del usuario)
+    const messagesSinceLastUser = lastUserIndex >= 0 ? mensajes.slice(lastUserIndex + 1) : mensajes;
+    const createMsgInTurn = messagesSinceLastUser.find(
       (m) => m.role === "tool" && m.name === "oc_crear"
     );
-    if (!hasCreated) {
+
+    if (!createMsgInTurn) {
       return {
         content: null,
         tool_calls: [
@@ -252,30 +370,30 @@ export class HeuristicFallbackLlmAdapter implements LlmAdapter {
             type: "function",
             function: {
               name: "oc_crear",
-              arguments: JSON.stringify({ caso, confirmado: isUserConfirming }),
+              arguments: JSON.stringify({
+                caso,
+                payload: payloadData,
+                confirmado: isUserConfirming || !hasConfirmationRules,
+              }),
             },
           },
         ],
       };
     }
 
-    // Si ya creamos, retornar resumen
-    const createMsg = mensajes.find(
-      (m) => m.role === "tool" && m.name === "oc_crear"
-    );
-    let createRes: any = {};
+    let createRes: { ok?: boolean; data?: Record<string, unknown>; error?: string } = {};
     try {
-      createRes = JSON.parse(createMsg?.content || "{}");
+      createRes = JSON.parse(createMsgInTurn.content || "{}");
     } catch {}
 
-    if (createRes.ok) {
+    if (createRes.ok && createRes.data) {
       return {
-        content: `¡Orden de Compra procesada exitosamente en SAP!\n\n• **Número OC**: ${createRes.data.numero_oc}\n• **Fecha**: ${createRes.data.fecha}\n• **Estado**: ${createRes.data.idempotente ? "Reutilizada (Idempotente)" : "Creada nueva"}\n• **Evidencia**: out/${caso}/aprobacion.pdf`,
+        content: `${resumenTabla}\n\n### ✅ ¡Orden de Compra Registrada en SAP!\n• **Número OC SAP:** \`${String(createRes.data.numero_oc)}\`\n• **Fecha de Registro:** ${String(createRes.data.fecha)}\n• **Idempotencia:** ${createRes.data.idempotente ? "Orden existente reutilizada (idempotente = true)" : "Nueva orden creada (idempotente = false)"}\n• **Evidencia PDF:** \`out/${caso}/aprobacion.pdf\`\n• **Trazabilidad:** \`out/${caso}/trazabilidad.json\``,
         tool_calls: [],
       };
     } else {
       return {
-        content: `No se pudo crear la orden de compra: ${createRes.error}`,
+        content: `No se pudo crear la orden de compra: ${createRes.error ?? "Error desconocido"}`,
         tool_calls: [],
       };
     }
