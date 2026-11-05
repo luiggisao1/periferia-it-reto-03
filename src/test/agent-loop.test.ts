@@ -1,7 +1,13 @@
 import { describe, it, expect, beforeEach } from "bun:test";
 import { rmSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import * as z from "zod";
+import { uuid7 } from "langsmith";
+import { MemorySaver } from "@langchain/langgraph";
+import { createAgent, tool } from "langchain";
 import { runAgentTurn } from "../agent/loop";
+import { contextSchema, leer_paquete } from "../tools/oc";
+import { AdapterChatModel } from "../llm/langchain";
 import type { LlmAdapter, AgentMessage, ToolDefinition, LlmResponse } from "../llm/adapter";
 
 const WORKSPACE_DIR = process.cwd();
@@ -233,6 +239,122 @@ describe("Agent Loop Execution & Control Contract", () => {
       expect(result).toBeDefined();
       expect(typeof result.reply).toBe("string");
       expect(result.reply.toLowerCase()).toMatch(/error|timeout|proveedor|fallo/i);
+    });
+  });
+
+  describe("5. LangChain createAgent + tool + MemorySaver + contextSchema + uuid7", () => {
+    it("maintains conversation memory across turns via threadId and injects config.context into tools", async () => {
+      const checkpointer = new MemorySaver();
+      const threadId = uuid7();
+
+      const adapter = new MockSequenceLlmAdapter([
+        {
+          content: null,
+          tool_calls: [
+            {
+              id: "call_mem_1",
+              type: "function",
+              function: {
+                name: "oc_leer_paquete",
+                arguments: JSON.stringify({ caso: "sol-001" }),
+              },
+            },
+          ],
+        },
+        {
+          content: "El solicitante de sol-001 es Juan Camargo.",
+          tool_calls: [],
+        },
+        {
+          content: "Como vimos en el turno anterior, el solicitante es Juan Camargo.",
+          tool_calls: [],
+        },
+      ]);
+
+      // Turn 1
+      const turn1 = await runAgentTurn({
+        threadId,
+        userMessage: "¿Quién es el solicitante de sol-001?",
+        adapter,
+        checkpointer,
+        directory: WORKSPACE_DIR,
+      });
+
+      expect(turn1.threadId).toBe(threadId);
+      expect(turn1.reply).toContain("Juan Camargo");
+      expect(turn1.toolCalls.length).toBe(1);
+      expect(turn1.toolCalls[0].name).toBe("oc_leer_paquete");
+
+      // Turn 2 on the same threadId without passing manual history (MemorySaver restores it)
+      const turn2 = await runAgentTurn({
+        threadId,
+        userMessage: "¿Me recuerdas el nombre del solicitante?",
+        adapter,
+        checkpointer,
+        directory: WORKSPACE_DIR,
+      });
+
+      expect(turn2.threadId).toBe(threadId);
+      expect(turn2.reply).toContain("Juan Camargo");
+      // Verify the second LLM call received the full conversation history from MemorySaver
+      const lastCallMessages = adapter.calls.at(-1)?.mensajes ?? [];
+      expect(lastCallMessages.some((m) => m.content?.includes("¿Quién es el solicitante de sol-001?"))).toBe(true);
+      expect(lastCallMessages.some((m) => m.content?.includes("El solicitante de sol-001 es Juan Camargo."))).toBe(true);
+    });
+
+    it("supports direct LangChain createAgent + tool(..., { schema }) + contextSchema invocation", async () => {
+      const getSessionContext = tool(
+        (_, config) => {
+          return `${config.context.sessionId}:${config.context.directory}`;
+        },
+        {
+          name: "get_session_context",
+          description: "Get the current session context.",
+          schema: z.object({}),
+        },
+      );
+
+      const adapter = new MockSequenceLlmAdapter([
+        {
+          content: null,
+          tool_calls: [
+            {
+              id: "call_ctx_1",
+              type: "function",
+              function: {
+                name: "get_session_context",
+                arguments: "{}",
+              },
+            },
+          ],
+        },
+        {
+          content: "Context verified.",
+          tool_calls: [],
+        },
+      ]);
+
+      const agent = createAgent({
+        model: new AdapterChatModel(adapter),
+        tools: [getSessionContext, leer_paquete],
+        checkpointer: new MemorySaver(),
+        contextSchema,
+      });
+
+      const threadId = uuid7();
+      const threadConfig = {
+        configurable: { thread_id: threadId },
+        context: { directory: WORKSPACE_DIR, sessionId: threadId },
+      };
+
+      const result = await agent.invoke(
+        {
+          messages: [{ role: "user", content: "Check session context" }],
+        },
+        threadConfig,
+      );
+
+      expect(result.messages.at(-1)?.content).toBe("Context verified.");
     });
   });
 });

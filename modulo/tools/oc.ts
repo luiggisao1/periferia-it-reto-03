@@ -6,5 +6,8 @@ export {
   crear,
   leer_excel,
   ocTools,
+  langchainTools,
+  contextSchema,
+  ocContextSchema,
   type ToolContext,
 } from "../../src/tools/oc";

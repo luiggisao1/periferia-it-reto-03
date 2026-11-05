@@ -1,18 +1,29 @@
+import * as z from "zod";
+import { uuid7 } from "langsmith";
+import { MemorySaver } from "@langchain/langgraph";
+import { AIMessage, ToolMessage, createAgent, createMiddleware } from "langchain";
 import { existsSync, readFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { z } from "zod";
-import type {
-  LlmAdapter,
-  AgentMessage,
-  ToolDefinition,
-  LlmResponse,
-} from "../llm/adapter";
-import { ocTools } from "../tools/oc";
+import type { LlmAdapter, AgentMessage } from "../llm/adapter";
+import {
+  AdapterChatModel,
+  LangChainLlmAdapter,
+  baseMessagesToAgentMessages,
+} from "../llm/langchain";
+import { ocTools, langchainTools, contextSchema } from "../tools/oc";
 
 export type { AgentMessage };
 
+/**
+ * Instancia compartida de MemorySaver (@langchain/langgraph) para persistir
+ * el historial conversacional por `thread_id`.
+ */
+export const memoryCheckpointer = new MemorySaver();
+export const defaultMemorySaver = memoryCheckpointer;
+
 export interface RunAgentTurnOptions {
-  sessionId: string;
+  sessionId?: string;
+  threadId?: string;
   userMessage: string;
   history?: AgentMessage[];
   adapter: LlmAdapter;
@@ -20,6 +31,7 @@ export interface RunAgentTurnOptions {
   maxIterations?: number;
   maxSessionTokens?: number;
   currentSessionTokens?: number;
+  checkpointer?: MemorySaver;
 }
 
 export interface ExecutedToolCall {
@@ -33,47 +45,13 @@ export interface ExecutedToolCall {
 }
 
 export interface RunAgentTurnResult {
+  threadId: string;
   reply: string;
   toolCalls: ExecutedToolCall[];
   needsConfirmation: boolean;
   updatedHistory: AgentMessage[];
   tokensUsed: number;
   error?: string;
-}
-
-function buildToolDefinitions(): ToolDefinition[] {
-  const definitions: ToolDefinition[] = [];
-
-  for (const [toolName, tool] of Object.entries(ocTools)) {
-    const properties: Record<string, unknown> = {};
-    const required: string[] = [];
-
-    for (const [argName, argSchema] of Object.entries(tool.args)) {
-      const isOptional = (argSchema as z.ZodTypeAny).isOptional();
-      if (!isOptional) {
-        required.push(argName);
-      }
-      properties[argName] = {
-        type: "string",
-        description: (argSchema as any).description ?? "",
-      };
-    }
-
-    definitions.push({
-      type: "function",
-      function: {
-        name: toolName,
-        description: tool.description,
-        parameters: {
-          type: "object",
-          properties,
-          required: required.length > 0 ? required : undefined,
-        },
-      },
-    });
-  }
-
-  return definitions;
 }
 
 function appendLog(
@@ -84,7 +62,7 @@ function appendLog(
     tool: string;
     args: unknown;
     result: unknown;
-  }
+  },
 ) {
   const outDir = join(directory, "out");
   mkdirSync(outDir, { recursive: true });
@@ -92,14 +70,7 @@ function appendLog(
   appendFileSync(logPath, JSON.stringify(entry) + "\n", "utf-8");
 }
 
-export async function runAgentTurn(options: RunAgentTurnOptions): Promise<RunAgentTurnResult> {
-  const directory = options.directory ?? process.cwd();
-  const maxIterations = options.maxIterations ?? (Number(process.env.MAX_ITERATIONS) || 25);
-  const executedToolCalls: ExecutedToolCall[] = [];
-  let needsConfirmation = false;
-  let tokensUsed = 0;
-
-  // 1. Cargar System Prompt y Conocimiento de proceso
+function loadSystemPrompt(directory: string): string {
   let systemContent =
     "Eres el Agente Especialista en Órdenes de Compra SAP para Periferia IT Group. Validas paquetes de compra contra maestros y controles internos.";
 
@@ -110,212 +81,264 @@ export async function runAgentTurn(options: RunAgentTurnOptions): Promise<RunAge
 
   const knowledgePath = join(directory, "src", "knowledge", "ordenes-compra.md");
   if (existsSync(knowledgePath)) {
-    systemContent += "\n\n# CONOCIMIENTO DEL PROCESO Y REGLAS DE CONTROL:\n" + readFileSync(knowledgePath, "utf-8");
+    systemContent +=
+      "\n\n# CONOCIMIENTO DEL PROCESO Y REGLAS DE CONTROL:\n" +
+      readFileSync(knowledgePath, "utf-8");
   }
 
-  // 2. Preparar historial de mensajes
-  const messages: AgentMessage[] = [];
-  if (options.history && options.history.length > 0) {
-    const hasSystem = options.history.some((m) => m.role === "system");
-    if (!hasSystem) {
-      messages.push({ role: "system", content: systemContent });
-    }
-    messages.push(...options.history);
-  } else {
-    messages.push({ role: "system", content: systemContent });
-  }
+  return systemContent;
+}
 
-  messages.push({ role: "user", content: options.userMessage });
+/**
+ * Construye el agente reactivo oficial usando `createAgent` de `langchain`,
+ * herramientas definidas con `tool(...)` + `zod`, `MemorySaver` y `contextSchema`.
+ */
+export function buildSapPurchaseOrderAgent(params: {
+  adapter: LlmAdapter;
+  directory: string;
+  checkpointer?: MemorySaver;
+  maxIterations: number;
+  onToolExecuted: (call: ExecutedToolCall) => void;
+  onTokensUsed: (tokens: number) => void;
+  getExecutedCount: () => number;
+}) {
+  const systemPrompt = loadSystemPrompt(params.directory);
 
-  const toolDefinitions = buildToolDefinitions();
+  const model =
+    params.adapter instanceof LangChainLlmAdapter
+      ? params.adapter.getChatModel()
+      : new AdapterChatModel(params.adapter);
 
-  // 3. Ciclo del Agente (Tope de iteraciones CA1)
-  for (let iteration = 0; iteration < maxIterations; iteration++) {
-    let response: LlmResponse;
-    try {
-      response = await options.adapter.enviar(messages, toolDefinitions);
-    } catch (err: unknown) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      return {
-        reply: `Error de comunicación con el proveedor LLM (timeout/fallo): ${errMsg}`,
-        toolCalls: executedToolCalls,
-        needsConfirmation: false,
-        updatedHistory: messages,
-        tokensUsed,
-        error: errMsg,
-      };
-    }
-
-    if (response.usage?.total_tokens) {
-      tokensUsed += response.usage.total_tokens;
-    }
-
-    // Si el LLM devolvió respuesta sin tool_calls -> fin del turno
-    if (!response.tool_calls || response.tool_calls.length === 0) {
-      const reply = response.content || "";
-      messages.push({ role: "assistant", content: reply });
-      return {
-        reply,
-        toolCalls: executedToolCalls,
-        needsConfirmation,
-        updatedHistory: messages,
-        tokensUsed,
-      };
-    }
-
-    // Agregar llamada del asistente al historial
-    messages.push({
-      role: "assistant",
-      content: response.content,
-      tool_calls: response.tool_calls,
-    });
-
-    // Ejecutar cada tool_call solicitada
-    for (const tc of response.tool_calls) {
-      let parsedArgs: Record<string, unknown> = {};
-      try {
-        parsedArgs =
-          typeof tc.function.arguments === "string"
-            ? JSON.parse(tc.function.arguments)
-            : (tc.function.arguments as Record<string, unknown>);
-      } catch {
-        parsedArgs = {};
+  const turnControlMiddleware = createMiddleware({
+    name: "SapOcTurnControlMiddleware",
+    contextSchema,
+    wrapModelCall: async (request, handler) => {
+      if (params.getExecutedCount() >= params.maxIterations) {
+        return new AIMessage({
+          content: `Se ha alcanzado el límite máximo de ${params.maxIterations} iteraciones por turno. Estado parcial: se ejecutaron ${params.getExecutedCount()} llamadas a herramientas.`,
+        });
       }
 
-      const tool = (ocTools as Record<string, any>)[tc.function.name];
-
-      // CA5: Validación tipada de argumentos con Zod antes de ejecutar
+      const aiMsg = await handler(request);
+      const totalTokens = aiMsg.usage_metadata?.total_tokens;
+      if (typeof totalTokens === "number" && totalTokens > 0) {
+        params.onTokensUsed(totalTokens);
+      }
+      return aiMsg;
+    },
+    wrapToolCall: async (request, handler) => {
       const startMs = Date.now();
       const nowIso = new Date().toISOString();
+      const tc = request.toolCall;
+      const toolName = tc.name;
+      const toolId = tc.id ?? `call_${Date.now()}`;
+      const rawArgs = (tc.args ?? {}) as Record<string, unknown>;
+      const sessionId = request.runtime.context?.sessionId ?? "default-session";
+      const directory = request.runtime.context?.directory ?? params.directory;
 
-      if (!tool) {
-        const errorResult = { ok: false, error: `Herramienta desconocida: "${tc.function.name}"` };
-        executedToolCalls.push({
-          id: tc.id,
-          name: tc.function.name,
-          args: parsedArgs,
+      const registeredTool = (ocTools as Record<string, { args?: z.ZodRawShape }>)[toolName];
+
+      if (!registeredTool) {
+        const errorResult = { ok: false, error: `Herramienta desconocida: "${toolName}"` };
+        const rawJson = JSON.stringify(errorResult);
+        params.onToolExecuted({
+          id: toolId,
+          name: toolName,
+          args: rawArgs,
           result: errorResult,
+          rawResult: rawJson,
           durationMs: Date.now() - startMs,
           timestamp: nowIso,
         });
         appendLog(directory, {
-          sessionId: options.sessionId,
+          sessionId,
           ts: nowIso,
-          tool: tc.function.name,
-          args: parsedArgs,
+          tool: toolName,
+          args: rawArgs,
           result: errorResult,
         });
-        messages.push({
-          role: "tool",
-          name: tc.function.name,
-          tool_call_id: tc.id,
-          content: JSON.stringify(errorResult),
+        return new ToolMessage({
+          name: toolName,
+          tool_call_id: toolId,
+          content: rawJson,
         });
-        continue;
       }
 
-      const argSchema = z.object(tool.args);
-      const validation = argSchema.safeParse(parsedArgs);
-
-      if (!validation.success) {
-        const errorResult = {
-          ok: false,
-          error: `Argumentos inválidos para ${tc.function.name}: ${validation.error.issues.map((i) => i.message).join(", ")}`,
-        };
-        executedToolCalls.push({
-          id: tc.id,
-          name: tc.function.name,
-          args: parsedArgs,
-          result: errorResult,
-          durationMs: Date.now() - startMs,
-          timestamp: nowIso,
-        });
-        appendLog(directory, {
-          sessionId: options.sessionId,
-          ts: nowIso,
-          tool: tc.function.name,
-          args: parsedArgs,
-          result: errorResult,
-        });
-        messages.push({
-          role: "tool",
-          name: tc.function.name,
-          tool_call_id: tc.id,
-          content: JSON.stringify(errorResult),
-        });
-        continue;
+      if (registeredTool.args) {
+        const validation = z.object(registeredTool.args).safeParse(rawArgs);
+        if (!validation.success) {
+          const errorResult = {
+            ok: false,
+            error: `Argumentos inválidos para ${toolName}: ${validation.error.issues.map((i) => i.message).join(", ")}`,
+          };
+          const rawJson = JSON.stringify(errorResult);
+          params.onToolExecuted({
+            id: toolId,
+            name: toolName,
+            args: rawArgs,
+            result: errorResult,
+            rawResult: rawJson,
+            durationMs: Date.now() - startMs,
+            timestamp: nowIso,
+          });
+          appendLog(directory, {
+            sessionId,
+            ts: nowIso,
+            tool: toolName,
+            args: rawArgs,
+            result: errorResult,
+          });
+          return new ToolMessage({
+            name: toolName,
+            tool_call_id: toolId,
+            content: rawJson,
+          });
+        }
       }
 
-      // Ejecución segura de la herramienta
-      const rawResult = await tool.execute(validation.data, {
-        directory,
-        sessionId: options.sessionId,
-      });
+      const responseMsg = await handler(request);
       const durationMs = Date.now() - startMs;
+      const rawContent =
+        typeof responseMsg === "object" && responseMsg !== null && "content" in responseMsg
+          ? typeof responseMsg.content === "string"
+            ? responseMsg.content
+            : JSON.stringify(responseMsg.content)
+          : String(responseMsg);
 
       let parsedResult: { ok: boolean; data?: unknown; error?: unknown };
       try {
-        parsedResult = JSON.parse(rawResult);
+        parsedResult = JSON.parse(rawContent);
       } catch {
-        parsedResult = { ok: false, error: rawResult };
+        parsedResult = { ok: false, error: rawContent };
       }
 
-      executedToolCalls.push({
-        id: tc.id,
-        name: tc.function.name,
-        args: validation.data as Record<string, unknown>,
+      params.onToolExecuted({
+        id: toolId,
+        name: toolName,
+        args: rawArgs,
         result: parsedResult,
-        rawResult,
+        rawResult: rawContent,
         durationMs,
         timestamp: nowIso,
       });
 
       appendLog(directory, {
-        sessionId: options.sessionId,
-        ts: new Date().toISOString(),
-        tool: tc.function.name,
-        args: validation.data,
+        sessionId,
+        ts: nowIso,
+        tool: toolName,
+        args: rawArgs,
         result: parsedResult,
       });
 
-      messages.push({
-        role: "tool",
-        name: tc.function.name,
-        tool_call_id: tc.id,
-        content: rawResult,
-      });
+      return responseMsg;
+    },
+  });
 
-      // CA3: Rastrear necesidad de confirmación humana
-      if (tc.function.name === "oc_validar" && parsedResult.ok) {
-        const valData = parsedResult.data as any;
+  return createAgent({
+    model,
+    tools: langchainTools,
+    checkpointer: params.checkpointer ?? memoryCheckpointer,
+    contextSchema,
+    systemPrompt,
+    middleware: [turnControlMiddleware],
+  });
+}
+
+export async function runAgentTurn(options: RunAgentTurnOptions): Promise<RunAgentTurnResult> {
+  const directory = options.directory ?? process.cwd();
+  const maxIterations = options.maxIterations ?? (Number(process.env.MAX_ITERATIONS) || 25);
+  const threadId = options.threadId ?? options.sessionId ?? uuid7();
+
+  const executedToolCalls: ExecutedToolCall[] = [];
+  let needsConfirmation = false;
+  let tokensUsed = 0;
+
+  const agent = buildSapPurchaseOrderAgent({
+    adapter: options.adapter,
+    directory,
+    checkpointer: options.checkpointer ?? memoryCheckpointer,
+    maxIterations,
+    getExecutedCount: () => executedToolCalls.length,
+    onTokensUsed: (t) => {
+      tokensUsed += t;
+    },
+    onToolExecuted: (call) => {
+      executedToolCalls.push(call);
+
+      if (call.name === "oc_validar" && call.result.ok) {
+        const valData = call.result.data as {
+          apta?: boolean;
+          confirmaciones?: unknown[];
+        } | null;
         if (
           valData?.apta === true &&
-          Array.isArray(valData?.confirmaciones) &&
+          Array.isArray(valData.confirmaciones) &&
           valData.confirmaciones.length > 0
         ) {
           needsConfirmation = true;
         }
       }
 
-      if (tc.function.name === "oc_crear") {
-        if (parsedResult.ok) {
+      if (call.name === "oc_crear") {
+        if (call.result.ok) {
           needsConfirmation = false;
-        } else if (String(parsedResult.error).toLowerCase().includes("confirmación")) {
+        } else if (String(call.result.error ?? "").toLowerCase().includes("confirmación")) {
           needsConfirmation = true;
         }
       }
-    }
-  }
+    },
+  });
 
-  // Si se alcanzó el tope de iteraciones
-  const reply = `Se ha alcanzado el límite máximo de ${maxIterations} iteraciones por turno. Estado parcial: se ejecutaron ${executedToolCalls.length} llamadas a herramientas sin converger a una respuesta final.`;
-  messages.push({ role: "assistant", content: reply });
-
-  return {
-    reply,
-    toolCalls: executedToolCalls,
-    needsConfirmation,
-    updatedHistory: messages,
-    tokensUsed,
+  const threadConfig = {
+    configurable: { thread_id: threadId },
+    context: { directory, sessionId: threadId },
+    recursionLimit: maxIterations * 3 + 10,
   };
+
+  try {
+    const result = await agent.invoke(
+      {
+        messages: [{ role: "user", content: options.userMessage }],
+      },
+      threadConfig,
+    );
+
+    const lastMessage = result.messages.at(-1);
+    const reply =
+      typeof lastMessage?.content === "string"
+        ? lastMessage.content
+        : Array.isArray(lastMessage?.content)
+          ? lastMessage.content
+              .map((b) =>
+                typeof b === "string"
+                  ? b
+                  : typeof b === "object" && b !== null && "text" in b
+                    ? String((b as { text?: unknown }).text ?? "")
+                    : "",
+              )
+              .join("")
+          : String(lastMessage?.content ?? "");
+
+    const updatedHistory = baseMessagesToAgentMessages(result.messages);
+
+    return {
+      threadId,
+      reply,
+      toolCalls: executedToolCalls,
+      needsConfirmation,
+      updatedHistory,
+      tokensUsed,
+    };
+  } catch (err: unknown) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    return {
+      threadId,
+      reply: `Error de comunicación con el proveedor LLM (timeout/fallo): ${errMsg}`,
+      toolCalls: executedToolCalls,
+      needsConfirmation: false,
+      updatedHistory: options.history ?? [],
+      tokensUsed,
+      error: errMsg,
+    };
+  }
 }

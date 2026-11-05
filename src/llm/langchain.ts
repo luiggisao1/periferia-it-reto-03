@@ -5,6 +5,11 @@ import {
   ToolMessage,
   type BaseMessage,
 } from "@langchain/core/messages";
+import { BaseChatModel, type BaseChatModelParams } from "@langchain/core/language_models/chat_models";
+import type { ChatResult } from "@langchain/core/outputs";
+import { ChatOpenAI } from "@langchain/openai";
+import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
+import { ChatAnthropic } from "@langchain/anthropic";
 import type {
   LlmAdapter,
   AgentMessage,
@@ -18,6 +23,204 @@ export interface LangChainModelConfig {
   modelName?: string;
   apiKey?: string;
   temperature?: number;
+}
+
+/**
+ * Instancia el modelo nativo de LangChain (@langchain/openai, @langchain/google-genai, @langchain/anthropic)
+ * listo para pasarse a `createAgent({ model, tools, checkpointer, contextSchema })`.
+ */
+export function createLangChainChatModel(config?: LangChainModelConfig): BaseChatModel {
+  const provider =
+    config?.provider ??
+    (process.env.LLM_PROVIDER as "openai" | "google" | "anthropic" | undefined) ??
+    (process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY
+      ? "google"
+      : process.env.ANTHROPIC_API_KEY
+        ? "anthropic"
+        : "openai");
+
+  if (provider === "google") {
+    return new ChatGoogleGenerativeAI({
+      model: config?.modelName ?? process.env.LLM_MODEL ?? process.env.GOOGLE_MODEL ?? "gemini-2.0-flash",
+      apiKey: config?.apiKey ?? process.env.GOOGLE_API_KEY ?? process.env.GEMINI_API_KEY,
+      temperature: config?.temperature ?? 0.1,
+    });
+  }
+
+  if (provider === "anthropic") {
+    return new ChatAnthropic({
+      model: config?.modelName ?? process.env.LLM_MODEL ?? process.env.ANTHROPIC_MODEL ?? "claude-3-5-haiku-latest",
+      apiKey: config?.apiKey ?? process.env.ANTHROPIC_API_KEY,
+      temperature: config?.temperature ?? 0.1,
+    });
+  }
+
+  return new ChatOpenAI({
+    model: config?.modelName ?? process.env.LLM_MODEL ?? process.env.OPENAI_MODEL ?? "gpt-4o-mini",
+    apiKey: config?.apiKey ?? process.env.OPENAI_API_KEY,
+    temperature: config?.temperature ?? 0.1,
+  });
+}
+
+/**
+ * Convierte BaseMessage[] de LangChain a AgentMessage[] de nuestro contrato LlmAdapter.
+ */
+export function baseMessagesToAgentMessages(messages: BaseMessage[]): AgentMessage[] {
+  return messages.map((m) => {
+    const type = m._getType();
+    const textContent =
+      typeof m.content === "string"
+        ? m.content
+        : Array.isArray(m.content)
+          ? m.content
+              .map((block) =>
+                typeof block === "string"
+                  ? block
+                  : typeof block === "object" && block !== null && "text" in block
+                    ? String((block as { text?: unknown }).text ?? "")
+                    : ""
+              )
+              .join("")
+          : String(m.content ?? "");
+
+    if (type === "system") {
+      return { role: "system", content: textContent };
+    }
+    if (type === "human") {
+      return { role: "user", content: textContent };
+    }
+    if (type === "tool" || ToolMessage.isInstance(m)) {
+      const tm = m as ToolMessage;
+      return {
+        role: "tool",
+        name: tm.name,
+        tool_call_id: tm.tool_call_id,
+        content: textContent,
+      };
+    }
+    if (type === "ai" || AIMessage.isInstance(m)) {
+      const ai = m as AIMessage;
+      const toolCalls: ToolCallRequest[] | undefined =
+        ai.tool_calls && ai.tool_calls.length > 0
+          ? ai.tool_calls.map((tc, i) => ({
+              id: tc.id ?? `call_${Date.now()}_${i}`,
+              type: "function" as const,
+              function: {
+                name: tc.name,
+                arguments: JSON.stringify(tc.args ?? {}),
+              },
+            }))
+          : undefined;
+      return {
+        role: "assistant",
+        content: textContent || null,
+        tool_calls: toolCalls,
+      };
+    }
+    return { role: "user", content: textContent };
+  });
+}
+
+/**
+ * Envuelve cualquier `LlmAdapter` como un `BaseChatModel` compatible con `createAgent` de `langchain`.
+ * Permite usar `createAgent({ model, tools, checkpointer, contextSchema })` tanto con modelos reales
+ * como con el adaptador determinista local y mocks de pruebas unitarias.
+ */
+export class AdapterChatModel extends BaseChatModel {
+  private adapter: LlmAdapter;
+  private boundToolDefs?: ToolDefinition[];
+
+  constructor(adapter: LlmAdapter, boundToolDefs?: ToolDefinition[], fields?: BaseChatModelParams) {
+    super(fields ?? {});
+    this.adapter = adapter;
+    this.boundToolDefs = boundToolDefs;
+  }
+
+  _llmType(): string {
+    return "sap_oc_adapter_chat_model";
+  }
+
+  override bindTools(tools: unknown[]): AdapterChatModel {
+    const defs: ToolDefinition[] = tools.map((t) => {
+      const toolObj = t as {
+        name?: string;
+        description?: string;
+        schema?: Record<string, unknown>;
+        function?: {
+          name: string;
+          description: string;
+          parameters: {
+            type: "object";
+            properties: Record<string, unknown>;
+            required?: string[];
+          };
+        };
+      };
+      if (toolObj.function) {
+        return {
+          type: "function",
+          function: toolObj.function,
+        };
+      }
+      return {
+        type: "function",
+        function: {
+          name: toolObj.name ?? "unknown_tool",
+          description: toolObj.description ?? "",
+          parameters: {
+            type: "object",
+            properties: (toolObj.schema as Record<string, unknown>) ?? {},
+          },
+        },
+      };
+    });
+    return new AdapterChatModel(this.adapter, defs);
+  }
+
+  async _generate(messages: BaseMessage[]): Promise<ChatResult> {
+    const agentMessages = baseMessagesToAgentMessages(messages);
+    const response = await this.adapter.enviar(agentMessages, this.boundToolDefs);
+
+    const lcToolCalls =
+      response.tool_calls?.map((tc) => {
+        let parsedArgs: Record<string, unknown> = {};
+        try {
+          parsedArgs =
+            typeof tc.function.arguments === "string"
+              ? JSON.parse(tc.function.arguments)
+              : (tc.function.arguments as Record<string, unknown>);
+        } catch {
+          parsedArgs = {};
+        }
+        return {
+          id: tc.id,
+          name: tc.function.name,
+          args: parsedArgs,
+          type: "tool_call" as const,
+        };
+      }) ?? [];
+
+    const aiMessage = new AIMessage({
+      content: response.content ?? "",
+      tool_calls: lcToolCalls,
+      usage_metadata: response.usage
+        ? {
+            input_tokens: response.usage.prompt_tokens ?? 0,
+            output_tokens: response.usage.completion_tokens ?? 0,
+            total_tokens: response.usage.total_tokens ?? 0,
+          }
+        : undefined,
+    });
+
+    return {
+      generations: [
+        {
+          text: response.content ?? "",
+          message: aiMessage,
+        },
+      ],
+    };
+  }
 }
 
 export class LangChainLlmAdapter implements LlmAdapter {
@@ -42,10 +245,11 @@ export class LangChainLlmAdapter implements LlmAdapter {
     }
   }
 
-  async enviar(mensajes: AgentMessage[], herramientas?: ToolDefinition[]): Promise<LlmResponse> {
-    const provider = this.config.provider ?? (process.env.LLM_PROVIDER as "openai" | "google" | "anthropic") ?? "openai";
+  public getChatModel(): BaseChatModel {
+    return createLangChainChatModel(this.config);
+  }
 
-    // 1. Convertir mensajes de AgentMessage[] a BaseMessage[] de LangChain
+  async enviar(mensajes: AgentMessage[], herramientas?: ToolDefinition[]): Promise<LlmResponse> {
     const lcMessages: BaseMessage[] = mensajes.map((m) => {
       switch (m.role) {
         case "system":
@@ -82,48 +286,23 @@ export class LangChainLlmAdapter implements LlmAdapter {
       }
     });
 
-    // 2. Instanciar cliente según proveedor
-    let model: any;
-    if (provider === "google") {
-      const { ChatGoogleGenerativeAI } = await import("@langchain/google-genai");
-      model = new ChatGoogleGenerativeAI({
-        model: this.config.modelName ?? process.env.GOOGLE_MODEL ?? "gemini-1.5-flash",
-        apiKey: this.config.apiKey ?? process.env.GOOGLE_API_KEY ?? process.env.GEMINI_API_KEY,
-        temperature: this.config.temperature ?? 0.1,
-      });
-    } else if (provider === "anthropic") {
-      const { ChatAnthropic } = await import("@langchain/anthropic");
-      model = new ChatAnthropic({
-        modelName: this.config.modelName ?? process.env.ANTHROPIC_MODEL ?? "claude-3-5-sonnet-20241022",
-        apiKey: this.config.apiKey ?? process.env.ANTHROPIC_API_KEY,
-        temperature: this.config.temperature ?? 0.1,
-      });
-    } else {
-      const { ChatOpenAI } = await import("@langchain/openai");
-      model = new ChatOpenAI({
-        modelName: this.config.modelName ?? process.env.OPENAI_MODEL ?? "gpt-4o-mini",
-        apiKey: this.config.apiKey ?? process.env.OPENAI_API_KEY,
-        temperature: this.config.temperature ?? 0.1,
-      });
-    }
+    const baseModel = this.getChatModel();
+    const runnableModel =
+      herramientas && herramientas.length > 0 && baseModel.bindTools
+        ? baseModel.bindTools(
+            herramientas.map((h) => ({
+              type: "function" as const,
+              function: {
+                name: h.function.name,
+                description: h.function.description,
+                parameters: h.function.parameters,
+              },
+            }))
+          )
+        : baseModel;
 
-    // 3. Vincular herramientas si se proporcionaron
-    if (herramientas && herramientas.length > 0) {
-      const formattedTools = herramientas.map((h) => ({
-        type: "function" as const,
-        function: {
-          name: h.function.name,
-          description: h.function.description,
-          parameters: h.function.parameters,
-        },
-      }));
-      model = model.bindTools(formattedTools);
-    }
+    const response = (await runnableModel.invoke(lcMessages)) as AIMessage;
 
-    // 4. Invocar modelo
-    const response = (await model.invoke(lcMessages)) as AIMessage;
-
-    // 5. Mapear respuesta
     const toolCalls: ToolCallRequest[] = [];
     if (response.tool_calls && response.tool_calls.length > 0) {
       for (const tc of response.tool_calls) {
@@ -138,16 +317,17 @@ export class LangChainLlmAdapter implements LlmAdapter {
       }
     }
 
-    const contentText = typeof response.content === "string" ? response.content : JSON.stringify(response.content);
+    const contentText =
+      typeof response.content === "string" ? response.content : JSON.stringify(response.content);
 
     return {
       content: contentText || null,
       tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
-      usage: (response as any).usage_metadata
+      usage: response.usage_metadata
         ? {
-            prompt_tokens: (response as any).usage_metadata.input_tokens,
-            completion_tokens: (response as any).usage_metadata.output_tokens,
-            total_tokens: (response as any).usage_metadata.total_tokens,
+            prompt_tokens: response.usage_metadata.input_tokens,
+            completion_tokens: response.usage_metadata.output_tokens,
+            total_tokens: response.usage_metadata.total_tokens,
           }
         : undefined,
     };
@@ -166,8 +346,11 @@ export class HeuristicFallbackLlmAdapter implements LlmAdapter {
     const lastUser = lastUserIndex >= 0 ? mensajes[lastUserIndex] : undefined;
     const userText = lastUser?.content?.toLowerCase() ?? "";
 
-    // Detectar si el usuario está rechazando
-    if (userText.includes("no confirmo") || userText.includes("rechazar") || userText.includes("devuelve el caso")) {
+    if (
+      userText.includes("no confirmo") ||
+      userText.includes("rechazar") ||
+      userText.includes("devuelve el caso")
+    ) {
       return {
         content:
           "Entendido. Se ha cancelado la creación de la Orden de Compra en SAP y se recomienda devolver el paquete al solicitante para ajustar las inconsistencias detectadas.",
@@ -175,7 +358,6 @@ export class HeuristicFallbackLlmAdapter implements LlmAdapter {
       };
     }
 
-    // Detectar caso mencionado en el último mensaje o recuperar el último caso leído en la sesión
     const casoMatch = userText.match(/\b(sol-\d{3})\b/i);
     let caso = casoMatch ? casoMatch[1]?.toLowerCase() : undefined;
 
@@ -198,10 +380,8 @@ export class HeuristicFallbackLlmAdapter implements LlmAdapter {
     }
     caso = caso ?? "sol-001";
 
-    // Buscar herramientas ya ejecutadas para este caso específico
     const toolMessagesForCase = mensajes.filter((m, idx) => {
       if (m.role !== "tool") return false;
-      // Verificar si la llamada previa corresponde al caso activo
       for (let j = idx - 1; j >= 0; j--) {
         const prev = mensajes[j];
         if (prev?.role === "assistant" && prev.tool_calls) {
@@ -274,7 +454,6 @@ export class HeuristicFallbackLlmAdapter implements LlmAdapter {
       };
     }
 
-    // Generar evidencia de aprobación antes de construir el payload
     const evidMsg = [...toolMessagesForCase].reverse().find((m) => m.name === "oc_generar_evidencia");
     if (!evidMsg) {
       return {
@@ -292,7 +471,6 @@ export class HeuristicFallbackLlmAdapter implements LlmAdapter {
       };
     }
 
-    // Construir el payload SAP con trazabilidad
     const payloadMsg = [...toolMessagesForCase].reverse().find((m) => m.name === "oc_construir_payload");
     if (!payloadMsg) {
       return {
@@ -355,7 +533,6 @@ export class HeuristicFallbackLlmAdapter implements LlmAdapter {
       };
     }
 
-    // Verificar si ya ejecutamos oc_crear en este turno (después del último mensaje del usuario)
     const messagesSinceLastUser = lastUserIndex >= 0 ? mensajes.slice(lastUserIndex + 1) : mensajes;
     const createMsgInTurn = messagesSinceLastUser.find(
       (m) => m.role === "tool" && m.name === "oc_crear"

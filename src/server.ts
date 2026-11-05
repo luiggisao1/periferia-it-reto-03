@@ -1,7 +1,13 @@
 import { serve } from "bun";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, resolve, normalize } from "node:path";
-import { runAgentTurn, type ExecutedToolCall, type AgentMessage } from "./agent/loop.ts";
+import { uuid7 } from "langsmith";
+import {
+  runAgentTurn,
+  defaultMemorySaver,
+  type ExecutedToolCall,
+  type AgentMessage,
+} from "./agent/loop.ts";
 import { createLlmAdapter } from "./llm/langchain.ts";
 
 export interface SessionTurn {
@@ -258,7 +264,7 @@ async function handleRequest(req: Request): Promise<Response> {
 
         const sessionId = body.sessionId && body.sessionId.trim().length > 0
           ? body.sessionId.trim()
-          : `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+          : uuid7();
 
         let session = sessions.get(sessionId);
         if (!session) {
@@ -279,6 +285,7 @@ async function handleRequest(req: Request): Promise<Response> {
           return jsonResponse({
             ok: false,
             sessionId: session.id,
+            threadId: session.id,
             reply: tokenReply,
             toolCalls: [],
             needsConfirmation: false,
@@ -288,9 +295,11 @@ async function handleRequest(req: Request): Promise<Response> {
 
         const turnResult = await runAgentTurn({
           sessionId: session.id,
+          threadId: session.id,
           userMessage,
           history: session.messages,
           adapter,
+          checkpointer: defaultMemorySaver,
           directory: process.cwd(),
           maxIterations: MAX_ITERATIONS,
           maxSessionTokens: MAX_SESSION_TOKENS,

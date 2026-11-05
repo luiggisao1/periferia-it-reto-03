@@ -7,7 +7,7 @@
 
 ## 1. Características Principales
 
-- **Agente Conversacional ReAct Autónomo:** Interfaz conversacional en tiempo real impulsada por LangChain con soporte multi-proveedor (Google Gemini 2.0 Flash, OpenAI GPT-4o-mini, Anthropic Claude 3.5 Haiku).
+- **Agente Conversacional ReAct Autónomo (`createAgent` + `tool` + `MemorySaver`):** Interfaz conversacional en tiempo real construida con `createAgent` y `tool` de `"langchain"`, persistencia de memoria conversacional por hilo con `MemorySaver` (`"@langchain/langgraph"`) e identificadores `uuid7` (`"langsmith"`), validación de contexto de ejecución mediante `contextSchema` (`zod`) y soporte multi-proveedor (`@langchain/google-genai`, `@langchain/openai`, `@langchain/anthropic`).
 - **Herramientas Tipadas Deterministas (`src/tools/oc.ts`):** 
   - `oc_leer_paquete`: Lectura normalizada de correo, solicitud, cotización, aprobación y factura opcional.
   - `oc_validar`: Matriz de 10 reglas de control (RC1 a RC10) clasificando bloqueos terminantes vs. confirmaciones humanas y derivación de maestros.

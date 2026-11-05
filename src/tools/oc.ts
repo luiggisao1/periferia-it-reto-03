@@ -1,4 +1,5 @@
-import { z } from "zod";
+import * as z from "zod";
+import { tool } from "langchain";
 import {
   existsSync,
   readFileSync,
@@ -6,7 +7,7 @@ import {
   mkdirSync,
   appendFileSync,
 } from "node:fs";
-import { join, dirname, isAbsolute } from "node:path";
+import { join, isAbsolute } from "node:path";
 import { createHash } from "node:crypto";
 import * as XLSX from "xlsx";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
@@ -26,9 +27,51 @@ import type {
   CentroCostoMaestro,
 } from "../types/domain";
 
-export interface ToolContext {
+export const contextSchema = z.object({
+  directory: z.string(),
+  sessionId: z.string(),
+});
+
+export const ocContextSchema = contextSchema;
+
+export type ToolContext = {
   directory: string;
   sessionId?: string;
+};
+
+type RuntimeConfigWithContext = {
+  context?: {
+    directory?: string;
+    sessionId?: string;
+  };
+};
+
+function createOcLangChainTool<TArgs extends z.ZodRawShape>(options: {
+  name: string;
+  description: string;
+  args: TArgs;
+  execute: (args: z.infer<z.ZodObject<TArgs>>, ctx: ToolContext) => Promise<string>;
+}) {
+  const schema = z.object(options.args);
+  const lcTool = tool(
+    async (input: z.infer<z.ZodObject<TArgs>>, config?: RuntimeConfigWithContext) => {
+      const ctx: ToolContext = {
+        directory: config?.context?.directory ?? process.cwd(),
+        sessionId: config?.context?.sessionId ?? "default-session",
+      };
+      return options.execute(input, ctx);
+    },
+    {
+      name: options.name,
+      description: options.description,
+      schema,
+    },
+  );
+
+  return Object.assign(lcTool, {
+    args: options.args,
+    execute: options.execute,
+  });
 }
 
 export function resolveCaseDir(directory: string, caso: string): string | null {
@@ -114,7 +157,8 @@ function appendControlCsv(
 // ---------------------------------------------------------------------------
 // Tool 1: leer_paquete
 // ---------------------------------------------------------------------------
-export const leer_paquete = {
+export const leer_paquete = createOcLangChainTool({
+  name: "oc_leer_paquete",
   description: "Lee y normaliza los documentos del paquete de compra (correo, solicitud, cotización, aprobación y factura)",
   args: {
     caso: z.string().describe("Nombre o ruta de la carpeta del caso en fixtures/solicitudes/"),
@@ -274,19 +318,20 @@ export const leer_paquete = {
       return JSON.stringify({ ok: false, error: msg });
     }
   },
-};
+});
 
 // ---------------------------------------------------------------------------
 // Tool 2: validar (RC1 - RC10)
 // ---------------------------------------------------------------------------
-export const validar = {
+export const validar = createOcLangChainTool({
+  name: "oc_validar",
   description: "Aplica las 10 reglas de control de compras contra los maestros SAP (RC1 a RC10)",
   args: {
     caso: z.string().describe("Identificador del caso evaluado"),
     paquete: z.any().describe("Estructura del paquete normalizado de oc_leer_paquete"),
   },
   async execute(
-    args: { caso: string; paquete: unknown },
+    args: { caso: string; paquete?: unknown },
     ctx: ToolContext
   ): Promise<string> {
     try {
@@ -540,12 +585,13 @@ export const validar = {
       return JSON.stringify({ ok: false, error: msg });
     }
   },
-};
+});
 
 // ---------------------------------------------------------------------------
 // Tool 3: generar_evidencia
 // ---------------------------------------------------------------------------
-export const generar_evidencia = {
+export const generar_evidencia = createOcLangChainTool({
+  name: "oc_generar_evidencia",
   description: "Genera archivo de texto y PDF con el correo de aprobación y su hash criptográfico SHA-256",
   args: {
     caso: z.string().describe("Identificador del caso para generar la evidencia"),
@@ -665,12 +711,13 @@ export const generar_evidencia = {
       return JSON.stringify({ ok: false, error: msg });
     }
   },
-};
+});
 
 // ---------------------------------------------------------------------------
 // Tool 4: construir_payload
 // ---------------------------------------------------------------------------
-export const construir_payload = {
+export const construir_payload = createOcLangChainTool({
+  name: "oc_construir_payload",
   description: "Construye el payload tipado de la Orden de Compra para SAP con validación Zod y trazabilidad de campos",
   args: {
     caso: z.string().describe("Identificador del caso"),
@@ -679,7 +726,7 @@ export const construir_payload = {
     confirmado_por: z.string().optional().describe("Usuario que autorizó las excepciones"),
   },
   async execute(
-    args: { caso: string; paquete: unknown; derivados?: unknown; confirmado_por?: string },
+    args: { caso: string; paquete?: unknown; derivados?: unknown; confirmado_por?: string },
     ctx: ToolContext
   ): Promise<string> {
     try {
@@ -810,12 +857,13 @@ export const construir_payload = {
       return JSON.stringify({ ok: false, error: msg });
     }
   },
-};
+});
 
 // ---------------------------------------------------------------------------
 // Tool 5: crear
 // ---------------------------------------------------------------------------
-export const crear = {
+export const crear = createOcLangChainTool({
+  name: "oc_crear",
   description: "Crea la orden de compra en SAP simulado asegurando reglas de control, confirmación humana e idempotencia",
   args: {
     caso: z.string().describe("Identificador del caso a crear en SAP"),
@@ -938,12 +986,13 @@ export const crear = {
       return JSON.stringify({ ok: false, error: msg });
     }
   },
-};
+});
 
 // ---------------------------------------------------------------------------
 // Tool 6: leer_excel
 // ---------------------------------------------------------------------------
-export const leer_excel = {
+export const leer_excel = createOcLangChainTool({
+  name: "oc_leer_excel",
   description: "Lee un archivo de hoja de cálculo .xlsx y devuelve sus filas en formato estructurado JSON",
   args: {
     ruta: z.string().describe("Ruta relativa o absoluta del archivo .xlsx a leer"),
@@ -973,11 +1022,20 @@ export const leer_excel = {
       return JSON.stringify({ ok: false, error: msg });
     }
   },
-};
+});
 
 // ---------------------------------------------------------------------------
-// Diccionario exportado de herramientas
+// Diccionario y lista exportada de herramientas LangChain
 // ---------------------------------------------------------------------------
+export const langchainTools = [
+  leer_paquete,
+  validar,
+  construir_payload,
+  generar_evidencia,
+  crear,
+  leer_excel,
+];
+
 export const ocTools = {
   oc_leer_paquete: leer_paquete,
   oc_validar: validar,
