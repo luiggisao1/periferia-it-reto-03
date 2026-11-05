@@ -1,3 +1,10 @@
+# Dependencias y artefactos generados en ejecución (Sección 9.5 PRD)
+node_modules/
+out/
+dist/
+.env
+.env.local
+.DS_Store
 
 # ==============================================================================
 # AGY Dev Harness: Local Agent Files
