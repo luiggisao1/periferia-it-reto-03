@@ -1,28 +1,32 @@
-import {
-  AIMessage,
-  HumanMessage,
-  SystemMessage,
-  ToolMessage,
-  type BaseMessage,
-} from "@langchain/core/messages";
+import { AIMessage, HumanMessage, SystemMessage, ToolMessage, type BaseMessage } from "@langchain/core/messages";
 import { BaseChatModel, type BaseChatModelParams } from "@langchain/core/language_models/chat_models";
 import type { ChatResult } from "@langchain/core/outputs";
 import { ChatOpenAI } from "@langchain/openai";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { ChatAnthropic } from "@langchain/anthropic";
-import type {
-  LlmAdapter,
-  AgentMessage,
-  ToolDefinition,
-  LlmResponse,
-  ToolCallRequest,
-} from "./adapter";
+import type { LlmAdapter, AgentMessage, ToolDefinition, LlmResponse, ToolCallRequest } from "./adapter";
 
 export interface LangChainModelConfig {
-  provider?: "openai" | "google" | "anthropic";
+  provider?: "openai" | "google" | "gemini" | "anthropic";
   modelName?: string;
   apiKey?: string;
   temperature?: number;
+}
+
+function resolveProvider(configProvider?: string): "openai" | "google" | "anthropic" {
+  const raw = (configProvider || process.env.LLM_PROVIDER || "auto").trim().toLowerCase();
+  if (raw === "google" || raw === "gemini") return "google";
+  if (raw === "anthropic" || raw === "claude") return "anthropic";
+  if (raw === "openai") return "openai";
+
+  // "auto" detection based on available non-empty API keys
+  if ((process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY || "").trim()) {
+    return "google";
+  }
+  if ((process.env.ANTHROPIC_API_KEY || "").trim()) {
+    return "anthropic";
+  }
+  return "openai";
 }
 
 /**
@@ -30,34 +34,28 @@ export interface LangChainModelConfig {
  * listo para pasarse a `createAgent({ model, tools, checkpointer, contextSchema })`.
  */
 export function createLangChainChatModel(config?: LangChainModelConfig): BaseChatModel {
-  const provider =
-    config?.provider ??
-    (process.env.LLM_PROVIDER as "openai" | "google" | "anthropic" | undefined) ??
-    (process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY
-      ? "google"
-      : process.env.ANTHROPIC_API_KEY
-        ? "anthropic"
-        : "openai");
+  const provider = resolveProvider(config?.provider);
+  const envModel = (process.env.LLM_MODEL || "").trim();
 
   if (provider === "google") {
     return new ChatGoogleGenerativeAI({
-      model: config?.modelName ?? process.env.LLM_MODEL ?? process.env.GOOGLE_MODEL ?? "gemini-2.0-flash",
-      apiKey: config?.apiKey ?? process.env.GOOGLE_API_KEY ?? process.env.GEMINI_API_KEY,
+      model: config?.modelName || envModel || (process.env.GOOGLE_MODEL || "").trim() || "gemini-2.5-flash",
+      apiKey: config?.apiKey || (process.env.GOOGLE_API_KEY || "").trim() || (process.env.GEMINI_API_KEY || "").trim(),
       temperature: config?.temperature ?? 0.1,
     });
   }
 
   if (provider === "anthropic") {
     return new ChatAnthropic({
-      model: config?.modelName ?? process.env.LLM_MODEL ?? process.env.ANTHROPIC_MODEL ?? "claude-3-5-haiku-latest",
-      apiKey: config?.apiKey ?? process.env.ANTHROPIC_API_KEY,
+      model: config?.modelName || envModel || (process.env.ANTHROPIC_MODEL || "").trim() || "claude-opus-5-5",
+      apiKey: config?.apiKey || (process.env.ANTHROPIC_API_KEY || "").trim(),
       temperature: config?.temperature ?? 0.1,
     });
   }
 
   return new ChatOpenAI({
-    model: config?.modelName ?? process.env.LLM_MODEL ?? process.env.OPENAI_MODEL ?? "gpt-4o-mini",
-    apiKey: config?.apiKey ?? process.env.OPENAI_API_KEY,
+    model: config?.modelName || envModel || (process.env.OPENAI_MODEL || "").trim() || "gpt-4o-mini",
+    apiKey: config?.apiKey || (process.env.OPENAI_API_KEY || "").trim(),
     temperature: config?.temperature ?? 0.1,
   });
 }
@@ -78,7 +76,7 @@ export function baseMessagesToAgentMessages(messages: BaseMessage[]): AgentMessa
                   ? block
                   : typeof block === "object" && block !== null && "text" in block
                     ? String((block as { text?: unknown }).text ?? "")
-                    : ""
+                    : "",
               )
               .join("")
           : String(m.content ?? "");
@@ -230,18 +228,16 @@ export class LangChainLlmAdapter implements LlmAdapter {
 
   constructor(config?: LangChainModelConfig) {
     this.config = config ?? {};
-    const prov =
-      this.config.provider ??
-      (process.env.LLM_PROVIDER as "openai" | "google" | "anthropic" | undefined) ??
-      "openai";
+    const prov = resolveProvider(this.config.provider);
+    const envModel = (process.env.LLM_MODEL || "").trim();
     this.provider = prov;
     if (prov === "google") {
-      this.model = this.config.modelName ?? process.env.LLM_MODEL ?? process.env.GOOGLE_MODEL ?? "gemini-2.0-flash";
+      this.model = this.config.modelName || envModel || (process.env.GOOGLE_MODEL || "").trim() || "gemini-2.5-flash";
     } else if (prov === "anthropic") {
       this.model =
-        this.config.modelName ?? process.env.LLM_MODEL ?? process.env.ANTHROPIC_MODEL ?? "claude-3-5-haiku-latest";
+        this.config.modelName || envModel || (process.env.ANTHROPIC_MODEL || "").trim() || "claude-3-5-haiku-latest";
     } else {
-      this.model = this.config.modelName ?? process.env.LLM_MODEL ?? process.env.OPENAI_MODEL ?? "gpt-4o-mini";
+      this.model = this.config.modelName || envModel || (process.env.OPENAI_MODEL || "").trim() || "gpt-4o-mini";
     }
   }
 
@@ -297,7 +293,7 @@ export class LangChainLlmAdapter implements LlmAdapter {
                 description: h.function.description,
                 parameters: h.function.parameters,
               },
-            }))
+            })),
           )
         : baseModel;
 
@@ -317,8 +313,7 @@ export class LangChainLlmAdapter implements LlmAdapter {
       }
     }
 
-    const contentText =
-      typeof response.content === "string" ? response.content : JSON.stringify(response.content);
+    const contentText = typeof response.content === "string" ? response.content : JSON.stringify(response.content);
 
     return {
       content: contentText || null,
@@ -346,11 +341,7 @@ export class HeuristicFallbackLlmAdapter implements LlmAdapter {
     const lastUser = lastUserIndex >= 0 ? mensajes[lastUserIndex] : undefined;
     const userText = lastUser?.content?.toLowerCase() ?? "";
 
-    if (
-      userText.includes("no confirmo") ||
-      userText.includes("rechazar") ||
-      userText.includes("devuelve el caso")
-    ) {
+    if (userText.includes("no confirmo") || userText.includes("rechazar") || userText.includes("devuelve el caso")) {
       return {
         content:
           "Entendido. Se ha cancelado la creación de la Orden de Compra en SAP y se recomienda devolver el paquete al solicitante para ajustar las inconsistencias detectadas.",
@@ -534,9 +525,7 @@ export class HeuristicFallbackLlmAdapter implements LlmAdapter {
     }
 
     const messagesSinceLastUser = lastUserIndex >= 0 ? mensajes.slice(lastUserIndex + 1) : mensajes;
-    const createMsgInTurn = messagesSinceLastUser.find(
-      (m) => m.role === "tool" && m.name === "oc_crear"
-    );
+    const createMsgInTurn = messagesSinceLastUser.find((m) => m.role === "tool" && m.name === "oc_crear");
 
     if (!createMsgInTurn) {
       return {
@@ -578,13 +567,13 @@ export class HeuristicFallbackLlmAdapter implements LlmAdapter {
 }
 
 export function createLlmAdapter(): LlmAdapter {
-  if (process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY) {
+  if ((process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY || "").trim()) {
     return new LangChainLlmAdapter({ provider: "google" });
   }
-  if (process.env.ANTHROPIC_API_KEY) {
+  if ((process.env.ANTHROPIC_API_KEY || "").trim()) {
     return new LangChainLlmAdapter({ provider: "anthropic" });
   }
-  if (process.env.OPENAI_API_KEY) {
+  if ((process.env.OPENAI_API_KEY || "").trim()) {
     return new LangChainLlmAdapter({ provider: "openai" });
   }
   return new HeuristicFallbackLlmAdapter();
