@@ -328,7 +328,8 @@ export const leer_paquete = createOcLangChainTool({
 // ---------------------------------------------------------------------------
 export const validar = createOcLangChainTool({
   name: "oc_validar",
-  description: "Aplica las 10 reglas de control de compras contra los maestros SAP (RC1 a RC10) para un caso dado",
+  description:
+    "Aplica las 10 reglas de control de compras contra los maestros SAP (RC1 a RC10) para un caso dado. Solo requiere el argumento 'caso' (no pases el objeto paquete).",
   args: {
     caso: z.string().describe("Identificador del caso evaluado, ej: sol-001"),
   },
@@ -732,10 +733,10 @@ export const generar_evidencia = createOcLangChainTool({
 // ---------------------------------------------------------------------------
 export const construir_payload = createOcLangChainTool({
   name: "oc_construir_payload",
-  description: "Construye el payload tipado de la Orden de Compra para SAP con validación Zod y trazabilidad de campos",
+  description:
+    "Construye el payload tipado de la Orden de Compra para SAP y guarda trazabilidad.json. Solo requiere el argumento 'caso' (no pases objetos paquete ni derivados).",
   args: {
     caso: z.string().describe("Identificador del caso, ej: sol-001"),
-    confirmado_por: z.string().optional().describe("Usuario o analista que autorizó las excepciones (opcional)"),
   },
   async execute(
     args: { caso: string; paquete?: unknown; derivados?: unknown; confirmado_por?: string },
@@ -893,13 +894,17 @@ export const construir_payload = createOcLangChainTool({
 // ---------------------------------------------------------------------------
 export const crear = createOcLangChainTool({
   name: "oc_crear",
-  description: "Crea la orden de compra en SAP simulado asegurando reglas de control, confirmación humana e idempotencia",
+  description:
+    "Crea la orden de compra en SAP simulado asegurando reglas de control, confirmación humana e idempotencia. Solo pasa 'caso' y opcionalmente 'confirmado' ('si' o 'no'). No pases el objeto payload.",
   args: {
     caso: z.string().describe("Identificador del caso a crear en SAP, ej: sol-001"),
-    confirmado: z.boolean().optional().describe("Confirmación explícita del analista para excepciones"),
+    confirmado: z
+      .string()
+      .optional()
+      .describe("Escribe 'si' cuando el analista humano haya confirmado crear la orden pese a observaciones, o 'no' en caso contrario"),
   },
   async execute(
-    args: { caso: string; payload?: unknown; confirmado?: boolean },
+    args: { caso: string; payload?: unknown; confirmado?: boolean | string },
     ctx: ToolContext
   ): Promise<string> {
     try {
@@ -942,7 +947,12 @@ export const crear = createOcLangChainTool({
       }
 
       // 3. Control de Confirmaciones Humanas
-      if (validacion.confirmaciones.length > 0 && args.confirmado !== true) {
+      const isConfirmed =
+        args.confirmado === true ||
+        ["true", "si", "sí", "yes", "1", "confirmado"].includes(
+          String(args.confirmado ?? "").trim().toLowerCase()
+        );
+      if (validacion.confirmaciones.length > 0 && !isConfirmed) {
         appendControlCsv(ctx.directory, {
           solicitud_id: solicitudId,
           resultado: "PENDIENTE_CONFIRMACION",

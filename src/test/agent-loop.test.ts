@@ -413,5 +413,76 @@ describe("Agent Loop Execution & Control Contract", () => {
       ]);
       expect(runA.reply).toBe(runB.reply);
     });
+
+    it("self-heals when Gemini throws Finish reason: MALFORMED_FUNCTION_CALL after oc_construir_payload on sol-001", async () => {
+      const adapter = new MockSequenceLlmAdapter([
+        {
+          content: null,
+          tool_calls: [
+            {
+              id: "call_1",
+              type: "function",
+              function: { name: "oc_leer_paquete", arguments: JSON.stringify({ caso: "sol-001" }) },
+            },
+          ],
+        },
+        {
+          content: null,
+          tool_calls: [
+            {
+              id: "call_2",
+              type: "function",
+              function: { name: "oc_validar", arguments: JSON.stringify({ caso: "sol-001" }) },
+            },
+          ],
+        },
+        {
+          content: null,
+          tool_calls: [
+            {
+              id: "call_3",
+              type: "function",
+              function: { name: "oc_generar_evidencia", arguments: JSON.stringify({ caso: "sol-001" }) },
+            },
+          ],
+        },
+        {
+          content: null,
+          tool_calls: [
+            {
+              id: "call_4",
+              type: "function",
+              function: { name: "oc_construir_payload", arguments: JSON.stringify({ caso: "sol-001" }) },
+            },
+          ],
+        },
+        // Simulate Gemini failing on the 5th tool call (oc_crear) with MALFORMED_FUNCTION_CALL
+        new Error("The model returned no content. Finish reason: MALFORMED_FUNCTION_CALL."),
+        {
+          content: "La orden de compra para sol-001 ha sido creada con éxito en SAP (No. 4500000001).",
+          tool_calls: [],
+        },
+      ]);
+
+      const result = await runAgentTurn({
+        threadId: uuid7(),
+        userMessage: "sol-001",
+        adapter,
+        checkpointer: new MemorySaver(),
+        directory: WORKSPACE_DIR,
+      });
+
+      expect(result.error).toBeUndefined();
+      expect(result.toolCalls.map((t) => t.name)).toEqual([
+        "oc_leer_paquete",
+        "oc_validar",
+        "oc_generar_evidencia",
+        "oc_construir_payload",
+        "oc_crear",
+      ]);
+      expect(result.toolCalls[4]?.result.ok).toBe(true);
+      expect(result.reply).toContain("4500000001");
+      expect(result.reply).not.toContain("MALFORMED_FUNCTION_CALL");
+    });
   });
 });

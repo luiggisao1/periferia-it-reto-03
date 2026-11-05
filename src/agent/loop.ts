@@ -10,6 +10,7 @@ import {
   AdapterChatModel,
   baseMessagesToAgentMessages,
 } from "../llm/base";
+import { DeterministicProvider } from "../llm/deterministic_provider";
 import { ocTools, langchainTools, contextSchema } from "../tools/oc";
 
 export type { AgentMessage };
@@ -119,12 +120,33 @@ export function buildSapPurchaseOrderAgent(params: {
         });
       }
 
-      const aiMsg = await handler(request);
-      const totalTokens = aiMsg.usage_metadata?.total_tokens;
-      if (typeof totalTokens === "number" && totalTokens > 0) {
-        params.onTokensUsed(totalTokens);
+      try {
+        const aiMsg = await handler(request);
+        const totalTokens = aiMsg.usage_metadata?.total_tokens;
+        if (typeof totalTokens === "number" && totalTokens > 0) {
+          params.onTokensUsed(totalTokens);
+        }
+        return aiMsg;
+      } catch (err: unknown) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (errMsg.includes("MALFORMED_FUNCTION_CALL") || errMsg.includes("EmptyContentError")) {
+          const fallback = await new DeterministicProvider().enviar(
+            baseMessagesToAgentMessages(request.messages),
+          );
+          const lcToolCalls =
+            fallback.tool_calls?.map((tc) => ({
+              id: tc.id,
+              name: tc.function.name,
+              args: JSON.parse(tc.function.arguments),
+              type: "tool_call" as const,
+            })) ?? [];
+          return new AIMessage({
+            content: fallback.content ?? "",
+            tool_calls: lcToolCalls,
+          });
+        }
+        throw err;
       }
-      return aiMsg;
     },
     wrapToolCall: async (request, handler) => {
       const startMs = Date.now();
@@ -133,6 +155,10 @@ export function buildSapPurchaseOrderAgent(params: {
       const toolName = tc.name;
       const toolId = tc.id ?? `call_${Date.now()}`;
       const rawArgs = (tc.args ?? {}) as Record<string, unknown>;
+      if (typeof rawArgs.confirmado === "boolean") {
+        rawArgs.confirmado = rawArgs.confirmado ? "si" : "no";
+        tc.args = rawArgs;
+      }
       const sessionId = request.runtime.context?.sessionId ?? "default-session";
       const directory = request.runtime.context?.directory ?? params.directory;
 

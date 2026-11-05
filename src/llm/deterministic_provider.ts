@@ -211,7 +211,7 @@ export class DeterministicProvider extends AIProvider {
               name: "oc_crear",
               arguments: JSON.stringify({
                 caso,
-                confirmado: isUserConfirming || !hasConfirmationRules,
+                confirmado: isUserConfirming || !hasConfirmationRules ? "si" : "no",
               }),
             },
           },
