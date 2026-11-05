@@ -8,7 +8,7 @@ import {
   type ExecutedToolCall,
   type AgentMessage,
 } from "./agent/loop.ts";
-import { createLlmAdapter } from "./llm/langchain.ts";
+import { createProvider } from "./llm/factory.ts";
 
 export interface SessionTurn {
   role: "user" | "assistant";
@@ -69,8 +69,8 @@ function saveSessions(): void {
 
 loadSessions();
 
-// Initialize LLM adapter
-const adapter = createLlmAdapter();
+// Initialize default AIProvider via Strategy Factory
+const adapter = createProvider();
 
 // Cached frontend JS bundle
 let cachedBundleJs: string | null = null;
@@ -188,8 +188,9 @@ async function handleRequest(req: Request): Promise<Response> {
     if (pathname === "/api/health" && req.method === "GET") {
       return jsonResponse({
         ok: true,
-        provider: (adapter as { provider?: string }).provider ?? "auto",
-        model: (adapter as { model?: string }).model ?? "default",
+        provider: adapter.name,
+        model: adapter.model,
+        availableProviders: ["gemini", "openai", "anthropic", "deterministic"],
         maxIterations: MAX_ITERATIONS,
         maxSessionTokens: MAX_SESSION_TOKENS,
       });
@@ -256,11 +257,17 @@ async function handleRequest(req: Request): Promise<Response> {
     // 5. Chat endpoint
     if (pathname === "/api/chat" && req.method === "POST") {
       try {
-        const body = (await req.json()) as { sessionId?: string; message?: string };
+        const body = (await req.json()) as {
+          sessionId?: string;
+          message?: string;
+          provider?: string;
+        };
         const userMessage = (body.message ?? "").trim();
         if (!userMessage) {
           return jsonResponse({ ok: false, error: "El campo 'message' es obligatorio" }, 400);
         }
+
+        const activeProvider = body.provider ? createProvider({ provider: body.provider }) : adapter;
 
         const sessionId = body.sessionId && body.sessionId.trim().length > 0
           ? body.sessionId.trim()
@@ -298,7 +305,7 @@ async function handleRequest(req: Request): Promise<Response> {
           threadId: session.id,
           userMessage,
           history: session.messages,
-          adapter,
+          adapter: activeProvider,
           checkpointer: defaultMemorySaver,
           directory: process.cwd(),
           maxIterations: MAX_ITERATIONS,

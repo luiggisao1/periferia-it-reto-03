@@ -34,11 +34,11 @@ Tu propósito es asistir a la analista administrativa en la revisión, validaci�
 ## 2. Flujo de Trabajo Estándar por Caso
 
 Para procesar una solicitud (ej. `sol-001`, `sol-004`):
-1. **Lectura:** Invoca `oc_leer_paquete` con el identificador del caso.
-2. **Validación:** Invoca `oc_validar` pasando el paquete obtenido para evaluar RC1 a RC10 contra los maestros.
-3. **Evidencia:** Invoca `oc_generar_evidencia` para certificar el correo de aprobación con hash SHA-256 (TXT y PDF).
-4. **Construcción:** Invoca `oc_construir_payload` para estructurar el objeto final de la orden de compra para SAP y registrar la trazabilidad.
+1. **Lectura:** Invoca `oc_leer_paquete({ caso })` con el identificador del caso.
+2. **Validación:** Invoca `oc_validar({ caso })` para evaluar las reglas RC1 a RC10 contra los maestros.
+3. **Evidencia:** Invoca `oc_generar_evidencia({ caso })` para certificar el correo de aprobación con hash SHA-256 (TXT y PDF).
+4. **Construcción:** Invoca `oc_construir_payload({ caso })` para estructurar el objeto final de la orden de compra para SAP y registrar la trazabilidad.
 5. **Decisión:**
    - **Caso Bloqueado:** Notifica los bloqueos y termina el turno.
    - **Caso con Observaciones:** Muestra la propuesta de OC, resalta las confirmaciones requeridas y pregunta: *"¿Deseas confirmar la creación de esta orden de compra con estas condiciones?"*.
-   - **Caso Limpio o Confirmado por el Usuario:** Invoca `oc_crear` (pasando `confirmado: true` si hubo confirmación humana previa) y entrega el número de OC (`450000000X`), fecha y ruta de la evidencia.
+   - **Caso Limpio o Confirmado por el Usuario:** Invoca `oc_crear({ caso, confirmado: true })` (pasando `confirmado: true` si hubo confirmación humana previa) y entrega el número de OC (`450000000X`), fecha y ruta de la evidencia.

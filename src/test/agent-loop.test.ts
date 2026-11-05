@@ -7,7 +7,15 @@ import { MemorySaver } from "@langchain/langgraph";
 import { createAgent, tool } from "langchain";
 import { runAgentTurn } from "../agent/loop";
 import { contextSchema, leer_paquete } from "../tools/oc";
-import { AdapterChatModel } from "../llm/langchain";
+import {
+  AIProvider,
+  AdapterChatModel,
+  GeminiProvider,
+  OpenAIProvider,
+  AnthropicProvider,
+  DeterministicProvider,
+  createProvider,
+} from "../llm/langchain";
 import type { LlmAdapter, AgentMessage, ToolDefinition, LlmResponse } from "../llm/adapter";
 
 const WORKSPACE_DIR = process.cwd();
@@ -355,6 +363,55 @@ describe("Agent Loop Execution & Control Contract", () => {
       );
 
       expect(result.messages.at(-1)?.content).toBe("Context verified.");
+    });
+
+    it("resolves providers via Strategy Factory and runs DeterministicProvider with identical repeatable output", async () => {
+      const gemini = createProvider({ provider: "gemini", apiKey: "test-gemini-key", modelName: "gemini-2.5-flash" });
+      const openai = createProvider({ provider: "openai", apiKey: "test-openai-key", modelName: "gpt-4o-mini" });
+      const anthropic = createProvider({ provider: "anthropic", apiKey: "test-anthropic-key" });
+      const deterministic = createProvider({ provider: "deterministic" });
+
+      expect(gemini).toBeInstanceOf(AIProvider);
+      expect(gemini).toBeInstanceOf(GeminiProvider);
+      expect(gemini.name).toBe("gemini");
+
+      expect(openai).toBeInstanceOf(AIProvider);
+      expect(openai).toBeInstanceOf(OpenAIProvider);
+      expect(openai.name).toBe("openai");
+
+      expect(anthropic).toBeInstanceOf(AIProvider);
+      expect(anthropic).toBeInstanceOf(AnthropicProvider);
+      expect(anthropic.name).toBe("anthropic");
+
+      expect(deterministic).toBeInstanceOf(AIProvider);
+      expect(deterministic).toBeInstanceOf(DeterministicProvider);
+      expect(deterministic.name).toBe("deterministic");
+
+      // Execute sol-004 twice on fresh threads using DeterministicProvider and verify identical output
+      const runA = await runAgentTurn({
+        threadId: uuid7(),
+        userMessage: 'Procesa la solicitud "sol-004". Muéstrame la OC y no la crees hasta que yo lo confirme.',
+        adapter: deterministic,
+        checkpointer: new MemorySaver(),
+        directory: WORKSPACE_DIR,
+      });
+
+      const runB = await runAgentTurn({
+        threadId: uuid7(),
+        userMessage: 'Procesa la solicitud "sol-004". Muéstrame la OC y no la crees hasta que yo lo confirme.',
+        adapter: deterministic,
+        checkpointer: new MemorySaver(),
+        directory: WORKSPACE_DIR,
+      });
+
+      expect(runA.needsConfirmation).toBe(true);
+      expect(runA.toolCalls.map((t) => t.name)).toEqual([
+        "oc_leer_paquete",
+        "oc_validar",
+        "oc_generar_evidencia",
+        "oc_construir_payload",
+      ]);
+      expect(runA.reply).toBe(runB.reply);
     });
   });
 });

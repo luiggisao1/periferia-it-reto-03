@@ -46,11 +46,14 @@ type RuntimeConfigWithContext = {
   };
 };
 
-function createOcLangChainTool<TArgs extends z.ZodRawShape>(options: {
+function createOcLangChainTool<
+  TArgs extends z.ZodRawShape,
+  TExecuteArgs extends Record<string, unknown> = z.infer<z.ZodObject<TArgs>>,
+>(options: {
   name: string;
   description: string;
   args: TArgs;
-  execute: (args: z.infer<z.ZodObject<TArgs>>, ctx: ToolContext) => Promise<string>;
+  execute: (args: TExecuteArgs, ctx: ToolContext) => Promise<string>;
 }) {
   const schema = z.object(options.args);
   const lcTool = tool(
@@ -59,7 +62,7 @@ function createOcLangChainTool<TArgs extends z.ZodRawShape>(options: {
         directory: config?.context?.directory ?? process.cwd(),
         sessionId: config?.context?.sessionId ?? "default-session",
       };
-      return options.execute(input, ctx);
+      return options.execute(input as unknown as TExecuteArgs, ctx);
     },
     {
       name: options.name,
@@ -325,17 +328,28 @@ export const leer_paquete = createOcLangChainTool({
 // ---------------------------------------------------------------------------
 export const validar = createOcLangChainTool({
   name: "oc_validar",
-  description: "Aplica las 10 reglas de control de compras contra los maestros SAP (RC1 a RC10)",
+  description: "Aplica las 10 reglas de control de compras contra los maestros SAP (RC1 a RC10) para un caso dado",
   args: {
-    caso: z.string().describe("Identificador del caso evaluado"),
-    paquete: z.any().describe("Estructura del paquete normalizado de oc_leer_paquete"),
+    caso: z.string().describe("Identificador del caso evaluado, ej: sol-001"),
   },
   async execute(
     args: { caso: string; paquete?: unknown },
     ctx: ToolContext
   ): Promise<string> {
     try {
-      const pkg = args.paquete as Paquete;
+      let pkg = args.paquete as Paquete | undefined;
+      if (!pkg) {
+        const pkgRaw = await leer_paquete.execute({ caso: args.caso }, ctx);
+        const pkgRes = JSON.parse(pkgRaw);
+        if (!pkgRes.ok) {
+          return JSON.stringify({
+            ok: false,
+            error: pkgRes.error ?? `No se pudo leer el paquete para el caso "${args.caso}"`,
+          });
+        }
+        pkg = pkgRes.data as Paquete;
+      }
+
       if (!pkg || !pkg.solicitud) {
         return JSON.stringify({
           ok: false,
@@ -720,18 +734,33 @@ export const construir_payload = createOcLangChainTool({
   name: "oc_construir_payload",
   description: "Construye el payload tipado de la Orden de Compra para SAP con validación Zod y trazabilidad de campos",
   args: {
-    caso: z.string().describe("Identificador del caso"),
-    paquete: z.any().describe("Datos del paquete normalizado de oc_leer_paquete"),
-    derivados: z.any().optional().describe("Valores derivados de maestros y reglas de control"),
-    confirmado_por: z.string().optional().describe("Usuario que autorizó las excepciones"),
+    caso: z.string().describe("Identificador del caso, ej: sol-001"),
+    confirmado_por: z.string().optional().describe("Usuario o analista que autorizó las excepciones (opcional)"),
   },
   async execute(
     args: { caso: string; paquete?: unknown; derivados?: unknown; confirmado_por?: string },
     ctx: ToolContext
   ): Promise<string> {
     try {
-      const pkg = args.paquete as Paquete;
-      const derivados = (args.derivados ?? {}) as Derivados;
+      let pkg = args.paquete as Paquete | undefined;
+      if (!pkg) {
+        const pkgRaw = await leer_paquete.execute({ caso: args.caso }, ctx);
+        const pkgRes = JSON.parse(pkgRaw);
+        if (!pkgRes.ok) {
+          return JSON.stringify({
+            ok: false,
+            error: pkgRes.error ?? `No se pudo leer el paquete del caso "${args.caso}"`,
+          });
+        }
+        pkg = pkgRes.data as Paquete;
+      }
+
+      let derivados = args.derivados as Derivados | undefined;
+      if (!derivados) {
+        const valRaw = await validar.execute({ caso: args.caso, paquete: pkg }, ctx);
+        const valRes = JSON.parse(valRaw);
+        derivados = (valRes.ok && valRes.data?.derivados ? valRes.data.derivados : {}) as Derivados;
+      }
 
       if (!pkg || !pkg.solicitud) {
         return JSON.stringify({
@@ -866,8 +895,7 @@ export const crear = createOcLangChainTool({
   name: "oc_crear",
   description: "Crea la orden de compra en SAP simulado asegurando reglas de control, confirmación humana e idempotencia",
   args: {
-    caso: z.string().describe("Identificador del caso a crear en SAP"),
-    payload: z.any().optional().describe("Payload de la orden de compra ya construido"),
+    caso: z.string().describe("Identificador del caso a crear en SAP, ej: sol-001"),
     confirmado: z.boolean().optional().describe("Confirmación explícita del analista para excepciones"),
   },
   async execute(

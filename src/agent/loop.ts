@@ -6,10 +6,10 @@ import { existsSync, readFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { LlmAdapter, AgentMessage } from "../llm/adapter";
 import {
+  AIProvider,
   AdapterChatModel,
-  LangChainLlmAdapter,
   baseMessagesToAgentMessages,
-} from "../llm/langchain";
+} from "../llm/base";
 import { ocTools, langchainTools, contextSchema } from "../tools/oc";
 
 export type { AgentMessage };
@@ -105,7 +105,7 @@ export function buildSapPurchaseOrderAgent(params: {
   const systemPrompt = loadSystemPrompt(params.directory);
 
   const model =
-    params.adapter instanceof LangChainLlmAdapter
+    params.adapter instanceof AIProvider
       ? params.adapter.getChatModel()
       : new AdapterChatModel(params.adapter);
 
