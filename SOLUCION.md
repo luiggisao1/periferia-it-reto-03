@@ -141,6 +141,12 @@ Un caso típico promedio (`sol-001` a `sol-006`) involucra:
 | **RC9** | Fecha de aprobación posterior o igual a solicitud | **Confirmación** | Comprueba que `aprobacion.fecha >= solicitud.fecha_solicitud`. Si la aprobación tiene fecha anterior a la solicitud, alerta posible inconsistencia documental y requiere confirmación. |
 | **RC10** | Consistencia aritmética de ítems | **Bloqueo** | Valida que `abs((cantidad * valor_unitario) - valor_total) <= 1` (tolerancia de 1 unidad por redondeos decimales). Si hay discrepancia aritmética, se bloquea por considerarse paquete malformado. |
 
+### 5.1 ¿Cuál fue la regla más difícil de implementar y por qué?
+
+La combinación más desafiante fue **RC1 combinada con RC6/RC7 (`sol-006`) y RC8 (`sol-005`)**:
+1. **Resolución difusa de proveedor (RC1 + RC6/RC7 en `sol-006`):** En la vida real (y en `sol-006`), la solicitud puede llegar con `proveedor_nit: null` y únicamente el nombre comercial (`"TecnoSuministros S.A.S."`), mientras que la cotización trae el NIT formateado con puntos y dígito de verificación (`"900.555.111-2"`). Fue necesario normalizar tanto NITs (removiendo puntos, espacios y el sufijo `-DV`) como razones sociales (normalización Unicode NFD sin tildes y case-insensitive) para cruzar con precisión contra `proveedores.json` y así poder derivar automáticamente `codigo_sap`, `indicador_iva` (`RC6`, que sí requiere confirmación humana) y `condiciones_pago` (`RC7`, que solo se informa sin bloquear ni pedir confirmación).
+2. **Trazabilidad de compra retroactiva (`RC8` en `sol-005`):** Requirió extraer mediante expresiones regulares la fecha de emisión desde un archivo no estructurado (`factura.txt`), compararla cronológicamente contra `fecha_solicitud`, activar la puerta de confirmación humana (CA3) y garantizar que la marca `retroactiva = true` viaje hasta `out/control.csv` incluso antes o después de la confirmación del analista.
+
 ---
 
 ## 6. Diseño del Adaptador SAP Real (Sección 7.5 del PRD)

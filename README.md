@@ -113,11 +113,16 @@ periferia-it-reto-03/
 │   ├── agent/
 │   │   └── loop.ts                      # Ciclo ReAct del agente, tope de iteraciones y confirmación
 │   ├── llm/
-│   │   ├── adapter.ts                   # Interfaz abstracta LlmAdapter
-│   │   └── langchain.ts                 # Adaptador LangChain multi-proveedor (Gemini, OpenAI, Anthropic)
+│   │   ├── adapter.ts                   # Contrato LlmAdapter
+│   │   ├── base.ts                      # Clase base abstracta AIProvider (Strategy Pattern)
+│   │   ├── gemini_provider.ts           # Proveedor Google Gemini (ChatGoogleGenerativeAI)
+│   │   ├── openai_provider.ts           # Proveedor OpenAI (ChatOpenAI)
+│   │   ├── anthropic_provider.ts        # Proveedor Anthropic Claude (ChatAnthropic)
+│   │   ├── deterministic_provider.ts    # Proveedor determinista reproducible sin API key
+│   │   ├── factory.ts                   # Fábrica de proveedores (createProvider)
+│   │   └── langchain.ts                 # Re-exportaciones unificadas de la capa LLM
 │   ├── tools/
-│   │   ├── oc.ts                        # Herramientas tipadas Zod (leer, validar, payload, evidencia, crear)
-│   │   └── index.ts                     # Registro y despacho de herramientas
+│   │   └── oc.ts                        # Herramientas tipadas con tool() de langchain + Zod
 │   ├── sap/
 │   │   ├── adapter.ts                   # Interfaz SapAdapter oficial (Sección 7.4)
 │   │   └── mock.ts                      # Adaptador SAP simulado sobre out/sap/ordenes.jsonl
