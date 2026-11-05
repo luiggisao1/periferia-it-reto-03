@@ -1,0 +1,19 @@
+
+# ==============================================================================
+# AGY Dev Harness: Local Agent Files
+# ------------------------------------------------------------------------------
+# These files power local AI agent orchestration, deterministic execution guards,
+# and red-to-green TDD synthesis at the local filesystem level.
+#
+# For public repositories, these files are intentionally gitignored to keep
+# version control clean and free of agent scratchpads or operational logs.
+# Only production code, tests, and human-facing docs (e.g. docs/adr/) are tracked.
+# ==============================================================================
+.agents/
+.gemini/
+GEMINI.md
+GEMINI.local.md
+tasks/
+memory/
+scripts/safety_guard.py
+scripts/tdd-check.sh
